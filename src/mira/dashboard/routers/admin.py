@@ -106,7 +106,12 @@ async def _register_and_index_repo(platform: str, env_token: str, body: BaseMode
             if store is not None:
                 store.close()
 
-    asyncio.create_task(_index())
+    if platform == "gitlab":
+        from mira.platforms.gitlab.background import spawn as spawn_gitlab_job
+
+        spawn_gitlab_job(_index())
+    else:
+        asyncio.create_task(_index())
     return {"status": "indexing", "owner": owner, "repo": repo, "platform": platform}
 
 
@@ -569,6 +574,15 @@ async def complete_setup(body: SetupRequest, request: Request) -> dict:
     if enabled_count > 0:
         import asyncio
 
-        asyncio.create_task(_run_initial_indexing(body.index_mode))
+        coro = _run_initial_indexing(body.index_mode)
+        has_gitlab = any(
+            r.get("platform", "github") == "gitlab" and r.get("enabled", True) for r in body.repos
+        )
+        if has_gitlab:
+            from mira.platforms.gitlab.background import spawn as spawn_gitlab_job
+
+            spawn_gitlab_job(coro)
+        else:
+            asyncio.create_task(coro)
 
     return {"status": "indexing" if enabled_count else "skipped", "repos": enabled_count}

@@ -28,6 +28,7 @@ from mira.platforms.github.webhook import (
     backfill_missing_indexes,
     dispatch_github_event,
 )
+from mira.platforms.gitlab.background import drain as drain_gitlab_background
 from mira.platforms.gitlab.http import GitLabHttpRuntime, gitlab_http_scope
 
 logger = logging.getLogger(__name__)
@@ -168,6 +169,9 @@ def create_app(
                 task.cancel()
         if background_tasks:
             await asyncio.gather(*background_tasks, return_exceptions=True)
+        # Dashboard indexing jobs borrow the same runtime; cancel and await
+        # their terminal cleanup before closing pooled clients.
+        await drain_gitlab_background()
         await runtime.aclose()
 
     app = FastAPI(title="Mira", lifespan=lifespan)

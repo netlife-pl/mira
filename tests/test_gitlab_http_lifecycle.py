@@ -9,8 +9,9 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -20,6 +21,9 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from mira.dashboard import api as dashboard_api
+from mira.dashboard import auth as dashboard_auth
+from mira.dashboard.routers import repos as repos_routes
 from mira.platforms.gitlab import http as gitlab_http
 from mira.platforms.gitlab.auth import GitLabTokenAuth
 from mira.platforms.gitlab.http import (
@@ -491,6 +495,76 @@ async def test_cancelled_request_releases_permit_and_runtime_stays_usable(
         assert runtime._closed is False
 
     assert recorder.created[0].is_closed is True
+
+
+async def test_dashboard_gitlab_index_job_is_drained_before_client_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real ``POST /api/repos/{owner}/{repo}/index`` spawn boundary must be
+    tracked, and its terminal cleanup must finish before pooled clients close.
+    """
+    _no_sleep(monkeypatch)
+    events: list[str] = []
+    recorder = ClientRecorder(events=events)
+    monkeypatch.setattr(gitlab_http, "_default_client_factory", recorder)
+    monkeypatch.setattr("mira.platforms.gitlab.webhook.backfill_gitlab_projects", _noop_discovery)
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/index-job"):
+            entered.set()
+            await release.wait()
+        return httpx.Response(200)
+
+    recorder.handler = handler
+
+    # Exercise the actual dashboard route/spawn boundary.
+    repo_path = "/api/repos/g/lifecycle-index-job/index"
+    monkeypatch.setattr(dashboard_auth, "_PUBLIC_PATHS", {repo_path})
+    monkeypatch.setattr(repos_routes, "_require_admin", lambda request: None)
+    monkeypatch.setenv("MIRA_GITLAB_TOKEN", TOKEN)
+    record = SimpleNamespace(platform="gitlab")
+    monkeypatch.setattr(
+        dashboard_api._app_db, "get_repo_any_platform", lambda owner, repo: [record]
+    )
+    monkeypatch.setattr(dashboard_api._app_db, "set_repo_status", MagicMock())
+    monkeypatch.setattr("mira.config.load_config", MagicMock())
+    monkeypatch.setattr("mira.llm.create_llm", MagicMock())
+    monkeypatch.setattr("mira.dashboard.models_config.llm_config_for", MagicMock())
+
+    store = MagicMock()
+    store.claim_index_run.return_value = object()
+    store.close.side_effect = lambda: events.append("store-closed")
+    monkeypatch.setattr(repos_routes, "IndexStore", MagicMock(open=lambda *args, **kwargs: store))
+
+    async def fake_index_repo(**kwargs: Any) -> int:
+        try:
+            await request_gitlab(TOKEN, API, "GET", f"{API}/index-job")
+            return 1
+        finally:
+            events.append("job-terminal")
+
+    monkeypatch.setattr("mira.index.indexer.index_repo", fake_index_repo)
+
+    app = _build_app()
+    try:
+        async with running_app(app) as client:
+            runtime = app.state.gitlab_http_runtime
+            response = await client.post(repo_path)
+            assert response.status_code == 200
+            assert response.json()["status"] == "indexing"
+            await entered.wait()
+            assert len(recorder.created) == 1
+            assert recorder.created[0].is_closed is False
+            assert runtime._closed is False
+    finally:
+        release.set()
+
+    assert runtime._closed is True
+    assert recorder.created[0].is_closed is True
+    assert events[-3:] == ["job-terminal", "store-closed", "client-closed"]
 
 
 # ---------------------------------------------------------------------------
