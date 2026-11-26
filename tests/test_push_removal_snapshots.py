@@ -13,6 +13,7 @@ from mira.index.store import FileSummary, IndexStore
 from mira.platforms import index_handlers
 from mira.platforms.fetch import IncompleteTreeError
 from mira.platforms.gitlab import webhook
+from mira.platforms.gitlab.http import GitLabRequestError
 
 OLDER = "a" * 40
 CURRENT = "b" * 40
@@ -207,6 +208,19 @@ async def test_incomplete_tree_indexes_changes_and_keeps_recovery_pending(
     await push(Fetcher(current_files()), [], ["keep.py"])
     assert index_store.all_paths() == {"keep.py"}
     assert not index_store.claim_index_run().needs_reconciliation
+
+
+async def test_exhausted_tree_indexes_changes_and_keeps_recovery_pending(index_store):
+    fetcher = Fetcher(current_files())
+    fetcher.repo_tree = AsyncMock(
+        side_effect=GitLabRequestError("exhausted retries (HTTP 503)", 5, 503)
+    )
+    await push(fetcher, ["gone.py"], ["keep.py"])
+    assert index_store.all_paths() == {"keep.py", "gone.py"}
+    assert index_store.get_summary("keep.py").summary == "current"
+    assert fetcher.refs == [CURRENT]
+    assert index_store.claim_index_run().needs_reconciliation
+    index_handlers._get_app_db().set_repo_status.assert_not_called()
 
 
 async def test_branch_lookup_http_error_still_indexes_changed_files(index_store):

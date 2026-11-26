@@ -13,6 +13,7 @@ from mira.core.file_types import language_from_extension
 from mira.index.extract import extract_symbols, find_symbol_by_name
 from mira.index.store import IndexStore
 from mira.models import PRInfo
+from mira.platforms.gitlab.http import GitLabRequestError
 from mira.providers.base import BaseProvider
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,15 @@ class ProviderSourceFetcher:
             content = await self._provider.get_file_content(self._pr_info, path, self._ref)
             self._cache[path] = content if content else None
             return self._cache[path]
+        except GitLabRequestError as exc:
+            # Transient/exhausted: warn and skip this path without caching it
+            # as absent, so a later fetch in the same review can still retry.
+            logger.warning(
+                "Source fetch for %s failed after retries; not treating it as missing: %s",
+                path,
+                exc,
+            )
+            return None
         except Exception as exc:
             logger.debug("Failed to fetch source for %s: %s", path, exc)
             self._cache[path] = None

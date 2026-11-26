@@ -11,6 +11,7 @@ from mira.index.indexer import IndexingRecoveryPending, index_diff, index_repo
 from mira.index.store import IndexingSuperseded, IndexStore
 from mira.llm import create_llm
 from mira.platforms.fetch import EmptyRepoError, IncompleteTreeError, RepoFetcher
+from mira.platforms.gitlab.http import GitLabRequestError
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,10 @@ async def run_incremental_index(
                 ref = await fetcher.branch_head(owner, repo, default_branch)
             if removed_paths or full_reindex:
                 tree_paths = await fetcher.repo_tree(owner, repo, ref)
-        except (EmptyRepoError, IncompleteTreeError, httpx.HTTPError) as exc:
+        except (EmptyRepoError, IncompleteTreeError, GitLabRequestError, httpx.HTTPError) as exc:
+            # Tree/branch acquisition failed (invalid, incomplete or exhausted):
+            # index only the changed paths and leave reconciliation pending
+            # rather than treating an unknown tree as a complete one.
             logger.warning(
                 "Index tree unavailable for %s/%s: %s. Indexing changed paths and leaving recovery pending.",
                 owner,

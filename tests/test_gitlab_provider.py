@@ -465,6 +465,87 @@ class TestGetFileHistory:
             assert await GitLabProvider("tok").get_file_history(_PR, []) == {}
 
 
+class TestExhaustedFetchSemantics:
+    """An exhausted GET is a typed failure, never fabricated absence."""
+
+    @pytest.fixture
+    def no_retry_sleeps(self, monkeypatch: pytest.MonkeyPatch):
+        async def _sleep(seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(gitlab_http, "_sleep", _sleep)
+
+    @pytest.mark.asyncio
+    async def test_exhausted_source_get_raises_typed_error(self, no_retry_sleeps):
+        requests: list[httpx.Request] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(503, headers={"retry-after": "0"})
+
+        provider = GitLabProvider("tok")
+        async with _mock_scope(handler):
+            with pytest.raises(GitLabRequestError) as excinfo:
+                await provider.get_file_content(_PR, "a.py", "feat")
+
+        assert excinfo.value.status_code == 503
+        assert excinfo.value.attempts == 5
+        assert len(requests) == 5
+
+    @pytest.mark.asyncio
+    async def test_missing_file_404_still_returns_empty_sentinel(self):
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, text="not found")
+
+        async with _mock_scope(handler):
+            assert await GitLabProvider("tok").get_file_content(_PR, "gone.py", "feat") == ""
+
+    @pytest.mark.asyncio
+    async def test_exhausted_tree_get_raises_typed_error(self, no_retry_sleeps):
+        requests: list[httpx.Request] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(503, headers={"retry-after": "0"})
+
+        async with _mock_scope(handler):
+            with pytest.raises(GitLabRequestError):
+                await GitLabProvider("tok").get_repo_tree(_PR, "main")
+
+        assert len(requests) == 5
+
+    @pytest.mark.asyncio
+    async def test_history_keeps_successful_entries_and_names_failed_path(
+        self, no_retry_sleeps, caplog
+    ):
+        requests: list[httpx.Request] = []
+        commits = [
+            {
+                "short_id": "abc12345",
+                "message": "fix thing",
+                "author_name": "Alice",
+                "authored_date": "2026-01-01",
+            }
+        ]
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.url.params.get("path") == "bad.py":
+                return httpx.Response(503, headers={"retry-after": "0"})
+            return httpx.Response(200, json=commits)
+
+        with caplog.at_level(logging.WARNING, logger="mira.providers.gitlab"):
+            async with _mock_scope(handler):
+                hist = await GitLabProvider("tok").get_file_history(
+                    _PR, ["a.py", "bad.py"], max_per_file=5
+                )
+
+        assert set(hist) == {"a.py"}
+        assert hist["a.py"][0].sha == "abc12345"
+        assert "bad.py" in caplog.text
+        assert len(requests) == 6
+
+
 class TestGetRepoPermission:
     @pytest.mark.asyncio
     async def test_looks_up_member_by_username(self):

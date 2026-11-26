@@ -2,15 +2,74 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
-from mira.index.context import build_code_context
+from mira.index.context import ProviderSourceFetcher, build_code_context
 from mira.index.store import (
     DirectorySummary,
     FileSummary,
     IndexStore,
     SymbolInfo,
 )
+from mira.models import PRInfo
+from mira.platforms.gitlab.http import GitLabRequestError
+
+
+class _StubProvider:
+    """Provider returning scripted outcomes, one per get_file_content call."""
+
+    def __init__(self, outcomes: list[object]) -> None:
+        self._outcomes = list(outcomes)
+        self.calls: list[str] = []
+
+    async def get_file_content(self, pr_info: PRInfo, path: str, ref: str) -> str:
+        self.calls.append(path)
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+_PR = PRInfo(
+    title="t",
+    description="d",
+    base_branch="main",
+    head_branch="feat",
+    url="u",
+    number=7,
+    owner="g",
+    repo="p",
+)
+
+
+class TestProviderSourceFetcher:
+    @pytest.mark.asyncio
+    async def test_transient_failure_is_not_cached_as_absence(self, caplog):
+        provider = _StubProvider(
+            [GitLabRequestError("exhausted retries (HTTP 503)", 5, 503), "x = 1\n"]
+        )
+        fetcher = ProviderSourceFetcher(provider, _PR, "feat")
+
+        with caplog.at_level(logging.WARNING):
+            assert await fetcher.fetch("a.py") is None
+        assert "a.py" in caplog.text
+
+        # The failed fetch was not remembered as "file absent": the retry
+        # reaches the provider again and its success is cached.
+        assert await fetcher.fetch("a.py") == "x = 1\n"
+        assert await fetcher.fetch("a.py") == "x = 1\n"
+        assert provider.calls == ["a.py", "a.py"]
+
+    @pytest.mark.asyncio
+    async def test_missing_file_stays_cached_as_absence(self):
+        provider = _StubProvider(["", "must not be used"])
+        fetcher = ProviderSourceFetcher(provider, _PR, "feat")
+
+        assert await fetcher.fetch("gone.py") is None
+        assert await fetcher.fetch("gone.py") is None
+        assert provider.calls == ["gone.py"]
 
 
 @pytest.fixture

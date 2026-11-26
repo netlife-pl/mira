@@ -461,9 +461,18 @@ async def test_file_content_failure_returns_none_and_releases_semaphore(
 
     if fetcher is GitLabRepoFetcher:
         async with _gitlab_scope(serve):
-            content = await fetcher("synthetic", "https://forge.example.invalid/api").file_content(
-                "example", "app", "src/main.py", "feature+draft", semaphore
-            )
+            if outcome == 404:
+                # A real 404 keeps its established missing-file sentinel.
+                content = await fetcher(
+                    "synthetic", "https://forge.example.invalid/api"
+                ).file_content("example", "app", "src/main.py", "feature+draft", semaphore)
+                assert content is None
+            else:
+                # An exhausted fetch must not be reported as an absent file.
+                with pytest.raises(GitLabRequestError):
+                    await fetcher("synthetic", "https://forge.example.invalid/api").file_content(
+                        "example", "app", "src/main.py", "feature+draft", semaphore
+                    )
         expected_sends = 1 if outcome == 404 else 5
     else:
         client = httpx.AsyncClient(transport=httpx.MockTransport(serve))
@@ -471,11 +480,28 @@ async def test_file_content_failure_returns_none_and_releases_semaphore(
             content = await fetcher("synthetic", "https://forge.example.invalid/api").file_content(
                 "example", "app", "src/main.py", "feature+draft", semaphore
             )
+        assert content is None
         expected_sends = 1
 
-    assert content is None
     assert acquired == [True] * expected_sends
     assert not semaphore.locked()
+
+
+@pytest.mark.asyncio
+async def test_gitlab_file_content_exhaustion_is_typed_not_absence(fast_gitlab_retries):
+    requests: list[httpx.Request] = []
+
+    async def serve(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(503, headers={"retry-after": "0"})
+
+    async with _gitlab_scope(serve):
+        with pytest.raises(GitLabRequestError) as excinfo:
+            await GitLabRepoFetcher("t").file_content("g", "p", "a.py", "main")
+
+    assert excinfo.value.status_code == 503
+    assert excinfo.value.attempts == 5
+    assert len(requests) == 5
 
 
 @pytest.mark.asyncio

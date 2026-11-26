@@ -26,7 +26,7 @@ from mira.models import (
     UnresolvedThread,
 )
 from mira.platforms import profiles
-from mira.platforms.gitlab.http import request_gitlab
+from mira.platforms.gitlab.http import GitLabRequestError, request_gitlab
 from mira.providers.base import BaseProvider
 from mira.providers.formatting import format_comment_body, format_key_issues
 
@@ -256,6 +256,11 @@ class GitLabProvider(BaseProvider):
         )
         try:
             resp = await self._request("GET", url, ok=(200, 404))
+        except GitLabRequestError:
+            # Exhausted retries/deadline are not evidence the file is absent;
+            # let the caller decide (optional context warns, thread
+            # verification leaves the path unresolved).
+            raise
         except ProviderError as exc:
             logger.warning("Failed to fetch %s@%s: %s", path, ref, exc)
             return ""
@@ -269,6 +274,10 @@ class GitLabProvider(BaseProvider):
         )
         try:
             items = await self._paginate(url)
+        except GitLabRequestError:
+            # An empty list here would read as "repo has no files". Propagate
+            # the typed failure so optional callers can degrade explicitly.
+            raise
         except Exception as exc:
             logger.debug("Failed to fetch repo tree: %s", exc)
             return []

@@ -19,7 +19,7 @@ from urllib.parse import quote
 import httpx
 
 from mira.platforms import profiles
-from mira.platforms.gitlab.http import request_gitlab
+from mira.platforms.gitlab.http import GitLabRequestError, request_gitlab
 
 logger = logging.getLogger(__name__)
 
@@ -407,6 +407,10 @@ class GitLabRepoFetcher:
                     logger.warning("Failed to fetch %s: HTTP %d", path, resp.status_code)
                     return None
                 return resp.text
+            except GitLabRequestError:
+                # ``None`` is the established missing-file sentinel; an
+                # exhausted fetch must not be recorded as one.
+                raise
             except Exception as exc:
                 logger.warning("Failed to fetch %s: %s", path, exc)
                 return None

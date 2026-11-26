@@ -7,6 +7,7 @@ import logging
 from mira.llm.prompts.verify_fixes import build_verify_fixes_prompt, parse_verify_fixes_response
 from mira.llm.provider import LLMProvider
 from mira.models import PRInfo, Severity, ThreadDecision, UnresolvedThread
+from mira.platforms.gitlab.http import GitLabRequestError
 from mira.providers.base import BaseProvider
 from mira.providers.formatting import parse_bot_comment_metadata
 
@@ -116,6 +117,10 @@ async def resolve_verified_threads(
     """Resolve unresolved bot threads the LLM confirms as fixed.
 
     Returns (threads_checked, threads_resolved, remaining_unresolved, decisions).
+
+    ``threads_checked`` counts only threads whose source was actually fetched
+    and submitted to the LLM; a path whose fetch exhausted stays unresolved
+    and out of the prompt rather than being verified as empty.
     """
     threads = await provider.get_unresolved_bot_threads(pr_info, bot_name)
     if not threads:
@@ -129,14 +134,29 @@ async def resolve_verified_threads(
     )
 
     file_contents: dict[str, str] = {}
+    unavailable_paths: set[str] = set()
     for t in threads:
-        if t.path not in file_contents:
+        if t.path in file_contents or t.path in unavailable_paths:
+            continue
+        try:
             file_contents[t.path] = await provider.get_file_content(
                 pr_info, t.path, pr_info.head_branch
             )
+        except GitLabRequestError as exc:
+            # An exhausted fetch says nothing about the file's content. Leave
+            # its threads out of LLM verification and unresolved below instead
+            # of submitting a fabricated empty source.
+            unavailable_paths.add(t.path)
+            logger.warning(
+                "Exhausted source fetch for %s; leaving its thread(s) unresolved: %s",
+                t.path,
+                exc,
+            )
+
+    verifiable_threads = [t for t in threads if t.path in file_contents]
 
     threads_by_path: dict[str, list[UnresolvedThread]] = {}
-    for t in threads:
+    for t in verifiable_threads:
         threads_by_path.setdefault(t.path, []).append(t)
 
     file_groups: list[tuple[str, str, list[UnresolvedThread]]] = []
@@ -153,7 +173,9 @@ async def resolve_verified_threads(
                 snippet = _extract_sections(lines, path_threads, _LARGE_FILE_CONTEXT_LINES)
                 file_groups.append((path, snippet, path_threads))
 
-    verified_ids = await verify_fixes(llm, file_groups)
+    # Nothing readable to verify (e.g. every path exhausted): do not ask the
+    # LLM to confirm fixes against a prompt with no source.
+    verified_ids = await verify_fixes(llm, file_groups) if file_groups else []
     verified_set = set(verified_ids)
 
     decisions = [
@@ -184,10 +206,10 @@ async def resolve_verified_threads(
 
     logger.info(
         "LLM verification: checked %d thread(s), %d confirmed fixed, %d resolved",
-        len(threads),
+        len(verifiable_threads),
         len(verified_ids),
         resolved,
     )
 
     remaining = [t for t in threads if t.thread_id not in verified_set]
-    return len(threads), resolved, remaining, decisions
+    return len(verifiable_threads), resolved, remaining, decisions
