@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -475,6 +475,104 @@ class TestGetRepoPermission:
                 "group", "proj", "alice", user_id=42
             )
         assert permission == "none"
+
+
+class TestRequestRetry:
+    @pytest.mark.asyncio
+    async def test_retries_429_then_succeeds(self):
+        attempts = []
+
+        def handler(method, url, **kw):
+            attempts.append(1)
+            if len(attempts) == 1:
+                return _FakeResp(status=429, text="Rate limit exceeded", headers={"Retry-After": "0"})
+            return _FakeResp(status=200, json_data={"ok": True})
+
+        with _patch(handler), patch(
+            "mira.providers.gitlab.asyncio.sleep", new=AsyncMock()
+        ) as sleep:
+            resp = await GitLabProvider("tok")._request("GET", "https://gitlab.example/api/v4/x")
+
+        assert resp.status_code == 200
+        assert len(attempts) == 2
+        sleep.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_gives_up_after_max_attempts(self):
+        attempts = []
+
+        def handler(method, url, **kw):
+            attempts.append(1)
+            return _FakeResp(status=429, text="Rate limit exceeded", headers={"Retry-After": "0"})
+
+        with _patch(handler), patch("mira.providers.gitlab.asyncio.sleep", new=AsyncMock()):
+            with pytest.raises(ProviderError):
+                await GitLabProvider("tok")._request("GET", "https://gitlab.example/api/v4/x")
+
+        assert len(attempts) == 5
+
+    @pytest.mark.asyncio
+    async def test_does_not_retry_other_client_errors(self):
+        attempts = []
+
+        def handler(method, url, **kw):
+            attempts.append(1)
+            return _FakeResp(status=404, text="not found")
+
+        with _patch(handler), patch("mira.providers.gitlab.asyncio.sleep", new=AsyncMock()) as sleep:
+            with pytest.raises(ProviderError):
+                await GitLabProvider("tok")._request("GET", "https://gitlab.example/api/v4/x")
+
+        assert len(attempts) == 1
+        sleep.assert_not_awaited()
+
+
+class TestPaginateRetry:
+    @pytest.mark.asyncio
+    async def test_retries_429_then_succeeds(self):
+        attempts = []
+
+        def handler(method, url, **kw):
+            attempts.append(url)
+            if len(attempts) == 1:
+                return _FakeResp(status=429, text="Rate limit exceeded", headers={"Retry-After": "0"})
+            return _FakeResp(json_data=[{"id": 1}])
+
+        with _patch(handler), patch("mira.providers.gitlab.asyncio.sleep", new=AsyncMock()) as sleep:
+            out = await GitLabProvider("tok")._paginate(
+                "https://gitlab.example/api/v4/projects/1/repository/tree"
+            )
+
+        assert out == [{"id": 1}]
+        assert len(attempts) == 2
+        sleep.assert_awaited_once()
+
+
+class TestGetFileHistoryRetry:
+    @pytest.mark.asyncio
+    async def test_retries_429_instead_of_returning_empty(self):
+        attempts = []
+
+        def handler(method, url, **kw):
+            attempts.append(1)
+            if len(attempts) == 1:
+                return _FakeResp(status=429, text="Rate limit exceeded", headers={"Retry-After": "0"})
+            return _FakeResp(
+                json_data=[
+                    {
+                        "short_id": "abc1234",
+                        "message": "fix thing",
+                        "author_name": "Alice",
+                        "authored_date": "2026-01-01",
+                    }
+                ]
+            )
+
+        with _patch(handler), patch("mira.providers.gitlab.asyncio.sleep", new=AsyncMock()):
+            hist = await GitLabProvider("tok").get_file_history(_PR, ["a.py"])
+
+        assert len(attempts) == 2
+        assert hist["a.py"][0].sha == "abc1234"
 
 
 class TestRegistry:
