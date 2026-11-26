@@ -50,6 +50,25 @@ class IndexingRecoveryPending(RuntimeError):
     """An interrupted index still needs a complete recovery pass."""
 
 
+async def _gather_cancelling_siblings(awaitables):
+    """Await concurrent children, draining them when one fails or we cancel.
+
+    ``asyncio.gather`` propagates the first child exception without cancelling
+    the others, so a failed fetch could return while siblings still hold pooled
+    connections and semaphore permits. Cancel every outstanding sibling, await
+    its cleanup, then re-raise the original exception or cancellation.
+    """
+    tasks = [asyncio.ensure_future(awaitable) for awaitable in awaitables]
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
 _TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "llm" / "prompts" / "templates"
 
 # Patterns to always skip (binaries, vendored code, lock files, etc.)
@@ -518,7 +537,7 @@ async def _index_repo(
             fetcher.file_content(owner, repo, indexable[i], branch, semaphore=fetch_sem)
             for i in missing
         ]
-        for i, content in zip(missing, await asyncio.gather(*fetch_tasks), strict=True):
+        for i, content in zip(missing, await _gather_cancelling_siblings(fetch_tasks), strict=True):
             contents[i] = content
 
     if run.needs_reconciliation and any(content is None for content in contents):
@@ -718,8 +737,8 @@ async def _read_paths(
     missing = [p for p in paths if not cached.get(p)]
     fetched: dict[str, str | None] = {}
     if missing:
-        results = await asyncio.gather(
-            *(fetcher.file_content(owner, repo, p, branch, semaphore=fetch_sem) for p in missing)
+        results = await _gather_cancelling_siblings(
+            fetcher.file_content(owner, repo, p, branch, semaphore=fetch_sem) for p in missing
         )
         fetched = dict(zip(missing, results, strict=False))
     return {p: cached.get(p) or fetched.get(p) for p in paths}
@@ -974,8 +993,8 @@ async def _refresh_manifests_incremental(
     if not changed and not removed:
         return 0
     fetch_sem = asyncio.Semaphore(_FILE_FETCH_SEMAPHORE)
-    contents = await asyncio.gather(
-        *(fetcher.file_content(owner, repo, p, branch, semaphore=fetch_sem) for p in changed)
+    contents = await _gather_cancelling_siblings(
+        fetcher.file_content(owner, repo, p, branch, semaphore=fetch_sem) for p in changed
     )
     touched = len(removed)
     with store.index_write(run):
@@ -1101,7 +1120,7 @@ async def _index_diff(
     tasks = [
         fetcher.file_content(owner, repo, path, branch, semaphore=fetch_sem) for path in to_index
     ]
-    contents = await asyncio.gather(*tasks)
+    contents = await _gather_cancelling_siblings(tasks)
 
     max_file_size = config.index.max_file_size
     file_pairs: list[tuple[str, str]] = []
