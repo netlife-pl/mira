@@ -1,5 +1,10 @@
 # Shared GitLab HTTP Transport Implementation Plan
 
+**Execution status:** Tasks 1–6 implemented with LongCat-2.5 implementers and
+GPT-6.1 Sol task reviews, followed by an independent whole-branch review and one
+reviewed fix wave. Historical per-step checkboxes below describe the original
+test-first procedure; this status and the execution notes record completion.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make all in-process GitLab jobs share pooled connections and throttle
@@ -289,7 +294,7 @@ checklist with verified results, not assumptions.
   replayable bodies, no token/query/body logging, and permits are released in a
   `finally` before sleeps.)
 - [x] Commit: `test(gitlab): verify shared pool and retry integration`.
-- [ ] Request fresh read-only whole-branch review against the spec and tests.
+- [x] Request fresh read-only whole-branch review against the spec and tests.
   Fix verified findings with focused failing-first regressions.
 - [ ] Push a new `ai/gitlab-shared-http` implementation branch and open a PR
   against fork main, linking https://github.com/netlife-pl/mira/pull/3 as
@@ -304,4 +309,41 @@ checklist with verified results, not assumptions.
 - [x] Cover cross-job gates, final-attempt cooldown and real connection reuse.
 - [x] Cover every discovered GitLab caller, not only review providers.
 - [x] Keep deployment, distributed coordination and other forge refactors out.
-- [ ] Human review of plan and execution approach before implementation.
+- [x] Human review of plan and execution approach before implementation.
+
+## Execution notes
+
+- Application-owned pools and runtime-owned dashboard job tracking keep clients
+  alive until their borrowers finish cancellation cleanup.
+- Both transient exhaustion and terminal source rejection propagate as typed
+  GitLab failures; accepted 404 and genuine empty responses retain their meaning.
+- Inline POST ambiguity never triggers another note write. Explicit HTTP 400
+  rejection retains the legacy plain-note fallback; status alone does not prove
+  the rejection was specifically caused by position validation.
+- File-fetch batches cancel and await outstanding siblings before returning a
+  failure. Normal and exceptional lifespan exits perform ordered cleanup.
+- Real loopback HTTP/1.1 tests prove sequential reuse of one TCP connection and
+  the eight-connection ceiling. The client-per-call negative control fails the
+  reuse assertion as intended.
+- Final fix-wave suite: 2934 passed, 79 skipped, 39 deselected; 21 warnings also
+  occurred on the baseline. No deployment or paid live reviews were performed.
+- Final GPT-6.1 Sol review: ready to merge, no blocking findings. Non-blocking
+  follow-up: strengthen the first-child-failure indexing test with a separate
+  release signal for the failing child; its current common release can let
+  siblings complete normally. The production cancellation/drain helper and the
+  separate parent-cancellation regression were reviewed.
+
+### Implementation decisions
+
+- Resolve the unavailable `openait` provider spelling to `openai` for the exact
+  requested GPT-6.1 Sol reviewer.
+- Use an isolated client-per-call negative control rather than changing the
+  production checkout to an earlier revision.
+- Run focused task gates, reserving whole-suite validation for baseline and final
+  integration; unrelated regressions may consequently be detected later.
+- Extend lifecycle wiring to dashboard spawn boundaries because app ownership
+  requires draining jobs that outlive their originating HTTP requests.
+- Count only actually submitted threads as checked when source is unavailable;
+  retain every unavailable thread unresolved.
+- Include terminal HTTP rejection in source-safety handling rather than treating
+  a permission/server rejection as evidence of an empty file.
