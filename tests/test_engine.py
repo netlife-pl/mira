@@ -1808,6 +1808,47 @@ class TestThreadVerificationUnavailablePaths:
         provider.resolve_threads.assert_awaited_once_with(pr_info, ["T1"])
 
     @pytest.mark.asyncio
+    async def test_llm_ids_without_readable_source_cannot_resolve(self, pr_info):
+        threads = [
+            UnresolvedThread(thread_id="T1", path="src/app.py", line=10, body="secret"),
+            UnresolvedThread(thread_id="T2", path="src/gone.py", line=3, body="null check"),
+        ]
+        provider = AsyncMock()
+        provider.get_unresolved_bot_threads = AsyncMock(return_value=threads)
+
+        async def _content(pr, path, ref):
+            if path == "src/gone.py":
+                raise GitLabRequestError("exhausted retries (HTTP 503)", 5, 503)
+            return "line1\n"
+
+        provider.get_file_content = AsyncMock(side_effect=_content)
+        provider.resolve_threads = AsyncMock(return_value=1)
+        llm = self._llm()
+        llm.complete = AsyncMock(
+            return_value=json.dumps(
+                {
+                    "results": [
+                        {"id": "T1", "fixed": True},
+                        {"id": "T2", "fixed": True},
+                        {"id": "GHOST", "fixed": True},
+                    ]
+                }
+            )
+        )
+
+        checked, resolved, remaining, decisions = await resolve_verified_threads(
+            provider, llm, pr_info, "mira", dry_run=False
+        )
+
+        # Only the readable thread may be resolved; the model's claims about
+        # the exhausted path and an unknown id are discarded.
+        assert checked == 1
+        assert resolved == 1
+        provider.resolve_threads.assert_awaited_once_with(pr_info, ["T1"])
+        assert [t.thread_id for t in remaining] == ["T2"]
+        assert {d.thread_id: d.fixed for d in decisions} == {"T1": True, "T2": False}
+
+    @pytest.mark.asyncio
     async def test_all_paths_exhausted_skips_the_llm(self, pr_info):
         threads = [UnresolvedThread(thread_id="T1", path="src/app.py", line=10, body="secret")]
         provider = AsyncMock()

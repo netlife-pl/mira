@@ -175,7 +175,19 @@ async def resolve_verified_threads(
 
     # Nothing readable to verify (e.g. every path exhausted): do not ask the
     # LLM to confirm fixes against a prompt with no source.
-    verified_ids = await verify_fixes(llm, file_groups) if file_groups else []
+    raw_verified_ids = await verify_fixes(llm, file_groups) if file_groups else []
+    # The parser accepts arbitrary strings; only IDs of threads whose source was
+    # actually shown may be resolved. A claim about an unavailable or unknown
+    # thread is discarded rather than acted on.
+    verifiable_ids = {t.thread_id for t in verifiable_threads}
+    verified_ids = [tid for tid in raw_verified_ids if tid in verifiable_ids]
+    unexpected_ids = [tid for tid in raw_verified_ids if tid not in verifiable_ids]
+    if unexpected_ids:
+        logger.warning(
+            "Ignoring %d LLM verification id(s) without readable source: %s",
+            len(unexpected_ids),
+            unexpected_ids,
+        )
     verified_set = set(verified_ids)
 
     decisions = [
