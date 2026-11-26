@@ -31,6 +31,28 @@ from mira.providers.formatting import format_comment_body, format_key_issues
 
 logger = logging.getLogger(__name__)
 
+# gitlab.com answers bursts with 429 + `Retry-After`. A single dropped fetch
+# silently removes a file from the review context, so transient failures are
+# retried with backoff instead of failing the call.
+_GITLAB_MAX_ATTEMPTS = 5
+_GITLAB_RETRY_BACKOFF_SECONDS = 1.0
+_GITLAB_MAX_RETRY_DELAY_SECONDS = 60.0
+
+
+def _retry_delay(resp: httpx.Response, attempt: int) -> float:
+    """Wait before retrying: the server's `Retry-After`, else exponential backoff."""
+    raw = (resp.headers.get("Retry-After") or "").strip()
+    if raw:
+        try:
+            return min(max(float(raw), 0.0), _GITLAB_MAX_RETRY_DELAY_SECONDS)
+        except ValueError:
+            pass
+    return min(
+        _GITLAB_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)),
+        _GITLAB_MAX_RETRY_DELAY_SECONDS,
+    )
+
+
 # https://gitlab.com/group/sub/project/-/merge_requests/123  or  group/project!123
 _MR_URL_PATTERN = re.compile(
     r"(?:https?://[^/]+/)?(?P<owner>.+?)/(?P<repo>[^/]+?)(?:/-/merge_requests/|!)(?P<number>\d+)"
@@ -106,18 +128,57 @@ class GitLabProvider(BaseProvider):
         self, method: str, url: str, *, ok: tuple[int, ...] = (200, 201), **kw: Any
     ) -> httpx.Response:
         headers = {"PRIVATE-TOKEN": self._token, **kw.pop("headers", {})}
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.request(method, url, headers=headers, **kw)
-        if resp.status_code not in ok:
-            raise ProviderError(f"GitLab {method} {url} → {resp.status_code}: {resp.text[:300]}")
-        return resp
+        for attempt in range(1, _GITLAB_MAX_ATTEMPTS + 1):
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.request(method, url, headers=headers, **kw)
+            if resp.status_code in ok:
+                return resp
+            retriable = resp.status_code == 429 or (
+                resp.status_code >= 500 and method.upper() == "GET"
+            )
+            if not retriable or attempt == _GITLAB_MAX_ATTEMPTS:
+                raise ProviderError(
+                    f"GitLab {method} {url} → {resp.status_code}: {resp.text[:300]}"
+                )
+            delay = _retry_delay(resp, attempt)
+            logger.warning(
+                "GitLab %s %s → %d; retrying in %.1fs (attempt %d/%d)",
+                method,
+                url,
+                resp.status_code,
+                delay,
+                attempt,
+                _GITLAB_MAX_ATTEMPTS,
+            )
+            await asyncio.sleep(delay)
+        raise AssertionError("unreachable")
+
+    async def _get_with_retries(
+        self, client: httpx.AsyncClient, url: str, **kw: Any
+    ) -> httpx.Response:
+        """GET that retries 429s with backoff; returns the last response."""
+        headers = {"PRIVATE-TOKEN": self._token, **kw.pop("headers", {})}
+        for attempt in range(1, _GITLAB_MAX_ATTEMPTS + 1):
+            resp = await client.get(url, headers=headers, **kw)
+            if resp.status_code != 429 or attempt == _GITLAB_MAX_ATTEMPTS:
+                return resp
+            delay = _retry_delay(resp, attempt)
+            logger.warning(
+                "GitLab GET %s → 429; retrying in %.1fs (attempt %d/%d)",
+                url,
+                delay,
+                attempt,
+                _GITLAB_MAX_ATTEMPTS,
+            )
+            await asyncio.sleep(delay)
+        raise AssertionError("unreachable")
 
     async def _paginate(self, url: str) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         next_url: str | None = url + ("&" if "?" in url else "?") + "per_page=100"
         async with httpx.AsyncClient(timeout=30) as client:
             while next_url:
-                resp = await client.get(next_url, headers={"PRIVATE-TOKEN": self._token})
+                resp = await self._get_with_retries(client, next_url)
                 resp.raise_for_status()
                 out.extend(resp.json())
                 next_url = _next_link(resp.headers.get("link", ""))
@@ -274,16 +335,15 @@ class GitLabProvider(BaseProvider):
 
         sem = asyncio.Semaphore(8)
         base = f"{self._project(pr_info)}/repository/commits"
-        headers = {"PRIVATE-TOKEN": self._token}
 
         async def _fetch_one(
             client: httpx.AsyncClient, path: str
         ) -> tuple[str, list[FileHistoryEntry]]:
             async with sem:
                 try:
-                    resp = await client.get(
+                    resp = await self._get_with_retries(
+                        client,
                         base,
-                        headers=headers,
                         params={
                             "path": path,
                             "ref_name": pr_info.head_branch,
