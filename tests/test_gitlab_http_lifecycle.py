@@ -567,6 +567,163 @@ async def test_dashboard_gitlab_index_job_is_drained_before_client_close(
     assert events[-3:] == ["job-terminal", "store-closed", "client-closed"]
 
 
+def _patch_trigger_index_route(
+    monkeypatch: pytest.MonkeyPatch, *, route_path: str, target: str, events: list[str]
+) -> None:
+    """Patch the real dashboard ``trigger_index`` spawn boundary for one job."""
+    monkeypatch.setattr(dashboard_auth, "_PUBLIC_PATHS", {route_path})
+    monkeypatch.setattr(repos_routes, "_require_admin", lambda request: None)
+    monkeypatch.setenv("MIRA_GITLAB_TOKEN", TOKEN)
+    monkeypatch.setattr(
+        dashboard_api._app_db,
+        "get_repo_any_platform",
+        lambda owner, repo: [SimpleNamespace(platform="gitlab")],
+    )
+    monkeypatch.setattr(dashboard_api._app_db, "set_repo_status", MagicMock())
+    monkeypatch.setattr("mira.config.load_config", MagicMock())
+    monkeypatch.setattr("mira.llm.create_llm", MagicMock())
+    monkeypatch.setattr("mira.dashboard.models_config.llm_config_for", MagicMock())
+
+    store = MagicMock()
+    store.claim_index_run.return_value = object()
+    store.close.side_effect = lambda: events.append("store-closed")
+    monkeypatch.setattr(repos_routes, "IndexStore", MagicMock(open=lambda *args, **kwargs: store))
+
+    async def fake_index_repo(**kwargs: Any) -> int:
+        try:
+            await request_gitlab(TOKEN, API, "GET", f"{API}{target}")
+            return 1
+        finally:
+            events.append("job-terminal")
+
+    monkeypatch.setattr("mira.index.indexer.index_repo", fake_index_repo)
+
+
+async def test_other_app_shutdown_does_not_drain_owners_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closing app B must not cancel app A's tracked indexing job."""
+    _no_sleep(monkeypatch)
+    events: list[str] = []
+    recorder = ClientRecorder(events=events)
+    monkeypatch.setattr(gitlab_http, "_default_client_factory", recorder)
+    monkeypatch.setattr("mira.platforms.gitlab.webhook.backfill_gitlab_projects", _noop_discovery)
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/isolation-job"):
+            entered.set()
+            await release.wait()
+        return httpx.Response(200)
+
+    recorder.handler = handler
+    route_path = "/api/repos/g/lifecycle-isolation/index"
+    _patch_trigger_index_route(
+        monkeypatch, route_path=route_path, target="/isolation-job", events=events
+    )
+
+    app_one = _build_app()
+    app_two = _build_app()
+    try:
+        async with running_app(app_one) as client_one:
+            runtime_one = app_one.state.gitlab_http_runtime
+            response = await client_one.post(route_path)
+            assert response.status_code == 200
+            await entered.wait()
+            async with running_app(app_two):
+                pass
+            # App B is gone; app A's job must still own its work and client.
+            assert "job-terminal" not in events
+            assert "store-closed" not in events
+            assert runtime_one._closed is False
+            assert recorder.created[0].is_closed is False
+    finally:
+        release.set()
+
+    assert runtime_one._closed is True
+    assert events[-3:] == ["job-terminal", "store-closed", "client-closed"]
+
+
+async def test_non_gitlab_setup_body_tracks_pending_gitlab_indexing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A GitHub-only setup request must still track GitLab work it selects."""
+    _no_sleep(monkeypatch)
+    events: list[str] = []
+    recorder = ClientRecorder(events=events)
+    monkeypatch.setattr(gitlab_http, "_default_client_factory", recorder)
+    monkeypatch.setattr("mira.platforms.gitlab.webhook.backfill_gitlab_projects", _noop_discovery)
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/setup-job"):
+            entered.set()
+            await release.wait()
+        return httpx.Response(200)
+
+    recorder.handler = handler
+    route_path = "/api/setup/complete"
+    monkeypatch.setattr(dashboard_auth, "_PUBLIC_PATHS", {route_path})
+    monkeypatch.setattr("mira.dashboard.routers.admin._require_admin", lambda request: None)
+    monkeypatch.setenv("MIRA_GITLAB_TOKEN", TOKEN)
+
+    # Eligible GitLab repo already pending in the database, even though the
+    # setup request body only mentions a GitHub repo.
+    pending = SimpleNamespace(
+        owner="g", repo="pending-proj", platform="gitlab", index_mode="full", status="indexing"
+    )
+    monkeypatch.setattr(dashboard_api._app_db, "list_repos", lambda: [pending])
+    monkeypatch.setattr(dashboard_api._app_db, "set_repo_index_mode", MagicMock())
+    monkeypatch.setattr(dashboard_api._app_db, "set_repo_status", MagicMock())
+    monkeypatch.setattr(dashboard_api._app_db, "mark_setup_complete", MagicMock())
+    monkeypatch.setattr("mira.config.load_config", MagicMock())
+    monkeypatch.setattr("mira.llm.create_llm", MagicMock())
+    monkeypatch.setattr("mira.dashboard.models_config.llm_config_for", MagicMock())
+
+    store = MagicMock()
+    store.claim_index_run.return_value = object()
+    store.close.side_effect = lambda: events.append("store-closed")
+    monkeypatch.setattr(dashboard_api, "IndexStore", MagicMock(open=lambda *args, **kwargs: store))
+
+    async def fake_index_repo(**kwargs: Any) -> int:
+        try:
+            await request_gitlab(TOKEN, API, "GET", f"{API}/setup-job")
+            return 1
+        finally:
+            events.append("job-terminal")
+
+    monkeypatch.setattr("mira.index.indexer.index_repo", fake_index_repo)
+
+    app = _build_app()
+    try:
+        async with running_app(app) as client:
+            runtime = app.state.gitlab_http_runtime
+            response = await client.post(
+                route_path,
+                json={
+                    "repos": [
+                        {"owner": "acme", "repo": "web", "platform": "github", "enabled": True}
+                    ],
+                    "index_mode": "full",
+                },
+            )
+            assert response.status_code == 200
+            await entered.wait()
+            assert len(recorder.created) == 1
+            assert recorder.created[0].is_closed is False
+            assert runtime._closed is False
+    finally:
+        release.set()
+
+    assert runtime._closed is True
+    assert recorder.created[0].is_closed is True
+    assert events[-3:] == ["job-terminal", "store-closed", "client-closed"]
+
+
 # ---------------------------------------------------------------------------
 # Per-app isolation
 # ---------------------------------------------------------------------------

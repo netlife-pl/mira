@@ -169,9 +169,10 @@ def create_app(
                 task.cancel()
         if background_tasks:
             await asyncio.gather(*background_tasks, return_exceptions=True)
-        # Dashboard indexing jobs borrow the same runtime; cancel and await
-        # their terminal cleanup before closing pooled clients.
-        await drain_gitlab_background()
+        # Dashboard indexing jobs borrow this same runtime; cancel and await
+        # their terminal cleanup before closing pooled clients. Other apps'
+        # registries are untouched.
+        await drain_gitlab_background(runtime)
         await runtime.aclose()
 
     app = FastAPI(title="Mira", lifespan=lifespan)

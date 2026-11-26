@@ -46,7 +46,9 @@ async def _sync_platform_repos(
     return {"registered": count}
 
 
-async def _register_and_index_repo(platform: str, env_token: str, body: BaseModel) -> dict:
+async def _register_and_index_repo(
+    platform: str, env_token: str, body: BaseModel, request: Request
+) -> dict:
     token = os.environ.get(env_token, "")
     if not token:
         raise HTTPException(status_code=400, detail=f"{env_token} is not configured")
@@ -109,7 +111,7 @@ async def _register_and_index_repo(platform: str, env_token: str, body: BaseMode
     if platform == "gitlab":
         from mira.platforms.gitlab.background import spawn as spawn_gitlab_job
 
-        spawn_gitlab_job(_index())
+        spawn_gitlab_job(_index(), request=request)
     else:
         asyncio.create_task(_index())
     return {"status": "indexing", "owner": owner, "repo": repo, "platform": platform}
@@ -143,7 +145,7 @@ async def register_gitlab_repo(body: GitLabRepoRegister, request: Request) -> di
     at ``/gitlab/webhook`` to get auto-review on new MRs.
     """
     _require_admin(request)
-    return await _register_and_index_repo("gitlab", "MIRA_GITLAB_TOKEN", body)
+    return await _register_and_index_repo("gitlab", "MIRA_GITLAB_TOKEN", body, request)
 
 
 @router.post("/api/forgejo/sync")
@@ -174,7 +176,7 @@ async def register_forgejo_repo(body: ForgejoRepoRegister, request: Request) -> 
     at ``/forgejo/webhook`` to get auto-review on new PRs.
     """
     _require_admin(request)
-    return await _register_and_index_repo("forgejo", "MIRA_FORGEJO_TOKEN", body)
+    return await _register_and_index_repo("forgejo", "MIRA_FORGEJO_TOKEN", body, request)
 
 
 @router.post("/api/bitbucket/sync")
@@ -206,7 +208,7 @@ async def register_bitbucket_repo(body: BitbucketRepoRegister, request: Request)
     on new PRs.
     """
     _require_admin(request)
-    return await _register_and_index_repo("bitbucket", "MIRA_BITBUCKET_TOKEN", body)
+    return await _register_and_index_repo("bitbucket", "MIRA_BITBUCKET_TOKEN", body, request)
 
 
 @router.get("/api/settings/models", response_model=ModelsResponse)
@@ -574,15 +576,9 @@ async def complete_setup(body: SetupRequest, request: Request) -> dict:
     if enabled_count > 0:
         import asyncio
 
-        coro = _run_initial_indexing(body.index_mode)
-        has_gitlab = any(
-            r.get("platform", "github") == "gitlab" and r.get("enabled", True) for r in body.repos
-        )
-        if has_gitlab:
-            from mira.platforms.gitlab.background import spawn as spawn_gitlab_job
-
-            spawn_gitlab_job(coro)
-        else:
-            asyncio.create_task(coro)
+        # Tracking is decided inside `_run_initial_indexing` from the actual
+        # eligible batch, so a GitLab repo already pending in the database is
+        # still owned even when this request's setup body only mentions GitHub.
+        asyncio.create_task(_run_initial_indexing(body.index_mode))
 
     return {"status": "indexing" if enabled_count else "skipped", "repos": enabled_count}
