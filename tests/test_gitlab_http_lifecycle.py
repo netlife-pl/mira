@@ -384,6 +384,33 @@ async def test_shutdown_cancels_and_awaits_discovery_before_closing_clients(
     assert "Exception in callback" not in caplog.text
 
 
+async def test_lifespan_exception_still_cancels_tasks_and_closes_clients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exceptional exit from the served app still runs lifespan cleanup."""
+    _no_sleep(monkeypatch)
+    recorder = ClientRecorder()
+    monkeypatch.setattr(gitlab_http, "_default_client_factory", recorder)
+
+    async def discovery(auth: Any) -> int:
+        await request_gitlab(TOKEN, API, "GET", f"{API}/discovery")
+        return 0
+
+    monkeypatch.setattr("mira.platforms.gitlab.webhook.backfill_gitlab_projects", discovery)
+    app = _build_app()
+
+    with pytest.raises(RuntimeError, match="boom"):
+        async with app.router.lifespan_context(app):
+            runtime = app.state.gitlab_http_runtime
+            await asyncio.sleep(0)  # let discovery open its pooled client
+            assert recorder.created
+            raise RuntimeError("boom")
+
+    assert runtime._closed is True
+    assert recorder.created
+    assert all(client.is_closed for client in recorder.created)
+
+
 # ---------------------------------------------------------------------------
 # Failure and cancellation safety
 # ---------------------------------------------------------------------------

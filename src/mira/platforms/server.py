@@ -156,24 +156,27 @@ def create_app(
         vuln_task = asyncio.create_task(run_vuln_poller())
         vuln_task.add_done_callback(lambda t: _log_background_failure(t, "Vuln poller crashed"))
 
-        yield
-        # Cancel every lifespan-owned task, await it (including GitLab
-        # discovery cancellation), then close the pooled clients.
-        background_tasks = [
-            task
-            for task in (backfill_task, gl_task, fj_task, bb_task, vuln_task)
-            if task is not None
-        ]
-        for task in background_tasks:
-            if not task.done():
-                task.cancel()
-        if background_tasks:
-            await asyncio.gather(*background_tasks, return_exceptions=True)
-        # Dashboard indexing jobs borrow this same runtime; cancel and await
-        # their terminal cleanup before closing pooled clients. Other apps'
-        # registries are untouched.
-        await drain_gitlab_background(runtime)
-        await runtime.aclose()
+        try:
+            yield
+        finally:
+            # Cancel every lifespan-owned task, await it (including GitLab
+            # discovery cancellation), then close the pooled clients. Runs on
+            # exceptional exits too so a crash cannot leak tasks or clients.
+            background_tasks = [
+                task
+                for task in (backfill_task, gl_task, fj_task, bb_task, vuln_task)
+                if task is not None
+            ]
+            for task in background_tasks:
+                if not task.done():
+                    task.cancel()
+            if background_tasks:
+                await asyncio.gather(*background_tasks, return_exceptions=True)
+            # Dashboard indexing jobs borrow this same runtime; cancel and await
+            # their terminal cleanup before closing pooled clients. Other apps'
+            # registries are untouched.
+            await drain_gitlab_background(runtime)
+            await runtime.aclose()
 
     app = FastAPI(title="Mira", lifespan=lifespan)
     app.add_middleware(_BindGitLabHttpRuntime, app=app)
