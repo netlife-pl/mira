@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import logging
 import ssl
 from collections.abc import AsyncIterator, Callable
@@ -252,6 +253,20 @@ async def ok_handler(request: httpx.Request) -> httpx.Response:
 
 async def _async_chunks() -> AsyncIterator[bytes]:
     yield b"chunk"
+
+
+class NonSeekableStream:
+    """A one-shot binary stream with no seek, so retries cannot replay it."""
+
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+        self._done = False
+
+    def read(self, size: int = -1) -> bytes:
+        if self._done:
+            return b""
+        self._done = True
+        return self._payload
 
 
 def make_runtime(handler, *, policy: GitLabRetryPolicy | None = None):
@@ -595,6 +610,74 @@ async def test_streaming_bodies_are_rejected(stream_factory) -> None:
                 content=stream_factory(),
             )
         assert sends == 0
+    finally:
+        await runtime.aclose()
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        pytest.param(
+            {"attachment": ("blob.bin", NonSeekableStream(b"payload"))},
+            id="dict-tuple",
+        ),
+        pytest.param(
+            [("attachment", ("blob.bin", NonSeekableStream(b"payload")))],
+            id="list-pairs",
+        ),
+        pytest.param({"attachment": NonSeekableStream(b"payload")}, id="bare"),
+    ],
+)
+async def test_non_seekable_nested_multipart_file_is_rejected(files) -> None:
+    sends = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal sends
+        sends += 1
+        return httpx.Response(429, headers={"Retry-After": "0"})
+
+    runtime, _ = make_runtime(handler)
+    try:
+        with pytest.raises(GitLabRequestError, match="non-replayable"):
+            await runtime.request(
+                "token",
+                GITLAB_API,
+                "POST",
+                f"{GITLAB_API}/uploads",
+                files=files,
+            )
+        assert sends == 0
+    finally:
+        await runtime.aclose()
+
+
+async def test_seekable_nested_multipart_file_is_replayed(
+    fake_clock: FakeClock,
+) -> None:
+    payload = io.BytesIO(b"file-bytes")
+    bodies: list[bytes] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(await request.aread())
+        if len(bodies) == 1:
+            return httpx.Response(429, headers={"Retry-After": "0"})
+        return httpx.Response(200)
+
+    runtime, _ = make_runtime(handler)
+    try:
+        response = await runtime.request(
+            "token",
+            GITLAB_API,
+            "POST",
+            f"{GITLAB_API}/uploads",
+            files={"attachment": ("blob.bin", payload)},
+        )
+        assert response.status_code == 200
+        assert len(bodies) == 2
+        assert b"file-bytes" in bodies[0]
+        assert b"file-bytes" in bodies[1]
+        assert b'filename="blob.bin"' in bodies[0]
+        assert b'filename="blob.bin"' in bodies[1]
     finally:
         await runtime.aclose()
 
@@ -1029,6 +1112,46 @@ async def test_aclose_is_idempotent() -> None:
     assert created[0].is_closed is True
 
 
+async def test_aclose_resumes_after_cancellation_with_multiple_clients() -> None:
+    runtime, created = make_runtime(ok_handler)
+    await runtime.request("token-a", GITLAB_API, "GET", f"{GITLAB_API}/a")
+    await runtime.request(
+        "token-b",
+        "https://other.example.com/api/v4",
+        "GET",
+        "https://other.example.com/api/v4/b",
+    )
+    assert len(created) == 2
+
+    entered = asyncio.Event()
+    resume = asyncio.Event()
+    original_close = created[0].aclose
+
+    async def slow_close() -> None:
+        entered.set()
+        await resume.wait()
+        await original_close()
+
+    created[0].aclose = slow_close  # type: ignore[method-assign]
+    try:
+        closing = asyncio.create_task(runtime.aclose(), name="closing")
+        await entered.wait()
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+        assert created[0].is_closed is False
+        assert created[1].is_closed is False
+
+        resume.set()
+        await wait_until(lambda: created[0].is_closed, what="shielded client close")
+        await runtime.aclose()
+        assert created[0].is_closed is True
+        assert created[1].is_closed is True
+    finally:
+        resume.set()
+        await runtime.aclose()
+
+
 def test_cross_event_loop_access_fails_explicitly() -> None:
     runtime, _ = make_runtime(ok_handler)
 
@@ -1265,6 +1388,71 @@ async def test_relative_target_is_resolved_under_api_root() -> None:
         response = await runtime.request("token", GITLAB_API, "GET", "projects/1")
         assert response.status_code == 200
         assert seen == "/api/v4/projects/1"
+    finally:
+        await runtime.aclose()
+
+
+async def test_absolute_dot_segment_target_cannot_escape_api_root() -> None:
+    sends = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal sends
+        sends += 1
+        return httpx.Response(200)
+
+    runtime, _ = make_runtime(handler)
+    try:
+        with pytest.raises(GitLabRequestError, match="root"):
+            await runtime.request(
+                "secret-token",
+                GITLAB_API,
+                "GET",
+                "https://gitlab.example.com/api/v4/../../admin",
+            )
+        assert sends == 0
+    finally:
+        await runtime.aclose()
+
+
+async def test_scheme_relative_dot_segment_target_cannot_escape_api_root() -> None:
+    sends = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal sends
+        sends += 1
+        return httpx.Response(200)
+
+    runtime, _ = make_runtime(handler)
+    try:
+        with pytest.raises(GitLabRequestError, match="root"):
+            await runtime.request(
+                "secret-token",
+                GITLAB_API,
+                "GET",
+                "//gitlab.example.com/api/v4/../user",
+            )
+        assert sends == 0
+    finally:
+        await runtime.aclose()
+
+
+async def test_dot_segments_are_canonicalized_before_dispatch() -> None:
+    paths: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        return httpx.Response(200)
+
+    runtime, _ = make_runtime(handler)
+    try:
+        response = await runtime.request(
+            "token",
+            GITLAB_API,
+            "GET",
+            "https://gitlab.example.com/api/v4/projects/../user",
+        )
+        assert response.status_code == 200
+        assert paths == ["/api/v4/user"]
     finally:
         await runtime.aclose()
 

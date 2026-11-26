@@ -248,7 +248,11 @@ def _resolve_target(url: str, api: _ApiTarget) -> str:
     configured origin or API root never receive a request.
     """
     try:
-        candidate = urljoin(api.base_url, str(url))
+        joined = urljoin(api.base_url, str(url))
+        # HTTPX canonicalizes dot segments when it builds the request. Apply
+        # the same URL semantics before validating so origin/root checks inspect
+        # the exact target that will be dispatched.
+        candidate = str(httpx.URL(joined))
         parts = urlsplit(candidate)
         scheme = parts.scheme.lower()
         host = parts.hostname
@@ -267,6 +271,41 @@ def _resolve_target(url: str, api: _ApiTarget) -> str:
     return candidate
 
 
+def _validate_file_value(value: Any) -> None:
+    """Recursively reject multipart payloads a retry could not replay.
+
+    HTTPX rewinds seekable file objects on every render, so those replay
+    unchanged. Streams without a working ``seek`` would be consumed by the
+    first attempt and must be rejected before dispatch.
+    """
+    if isinstance(value, (bytes, bytearray, str)):
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            _validate_file_value(item)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _validate_file_value(item)
+        return
+    if hasattr(value, "read"):
+        seekable = getattr(value, "seekable", None)
+        if not callable(seekable):
+            raise GitLabRequestError("non-replayable request body", 0)
+        try:
+            rewindable = bool(seekable())
+        except Exception as exc:
+            raise GitLabRequestError("non-replayable request body", 0) from exc
+        if not rewindable:
+            raise GitLabRequestError("non-replayable request body", 0)
+        try:
+            value.seek(0)
+        except Exception as exc:
+            raise GitLabRequestError("non-replayable request body", 0) from exc
+        return
+    raise GitLabRequestError("non-replayable request body", 0)
+
+
 def _validate_replayable_body(body_kwargs: dict[str, Any]) -> None:
     """Reject streaming bodies that cannot be replayed for automatic retry."""
     content = body_kwargs.get("content")
@@ -276,8 +315,10 @@ def _validate_replayable_body(body_kwargs: dict[str, Any]) -> None:
     if data is not None and not isinstance(data, (dict, list, tuple)):
         raise GitLabRequestError("non-replayable request body", 0)
     files = body_kwargs.get("files")
-    if files is not None and not isinstance(files, (dict, list, tuple)):
-        raise GitLabRequestError("non-replayable request body", 0)
+    if files is not None:
+        if not isinstance(files, (dict, list, tuple)):
+            raise GitLabRequestError("non-replayable request body", 0)
+        _validate_file_value(files)
 
 
 def _extend_cooldown(state: _EndpointState, not_before: float) -> None:
@@ -374,6 +415,8 @@ class GitLabHttpRuntime:
         self._client_factory = client_factory or _default_client_factory
         self._states: dict[tuple[str, str, int, str, str], _EndpointState] = {}
         self._closed = False
+        self._pending_clients: list[httpx.AsyncClient] = []
+        self._close_lock = asyncio.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
 
     def _state_for(self, token_digest: str, api: _ApiTarget) -> _EndpointState:
@@ -576,21 +619,36 @@ class GitLabHttpRuntime:
         raise GitLabRequestError("exhausted retries", attempts)
 
     async def aclose(self) -> None:
-        """Close pooled clients once; safe to call repeatedly."""
-        if self._closed:
+        """Close pooled clients once; interrupted cleanup resumes on the next call."""
+        if self._closed and not self._pending_clients:
             return
         loop = asyncio.get_running_loop()
         if self._loop is not None and self._loop is not loop:
             raise RuntimeError("GitLabHttpRuntime cannot be closed from a different event loop")
         self._closed = True
-        clients = [state.client for state in self._states.values() if state.client is not None]
-        for state in self._states.values():
-            state.client = None
-        for client in clients:
-            try:
-                await client.aclose()
-            except Exception:
-                logger.debug("Failed to close a pooled GitLab client", exc_info=True)
+        async with self._close_lock:
+            if not self._pending_clients:
+                self._pending_clients.extend(
+                    state.client for state in self._states.values() if state.client is not None
+                )
+                for state in self._states.values():
+                    state.client = None
+            index = 0
+            while index < len(self._pending_clients):
+                client = self._pending_clients[index]
+                cancelled = False
+                try:
+                    # Shield so an interrupted teardown leaves the client
+                    # pending for the next aclose() instead of losing it.
+                    await asyncio.shield(client.aclose())
+                except asyncio.CancelledError:
+                    cancelled = True
+                    raise
+                except Exception:
+                    logger.debug("Failed to close a pooled GitLab client", exc_info=True)
+                finally:
+                    if not cancelled:
+                        del self._pending_clients[index]
 
 
 _RUNTIME_CONTEXT: ContextVar[GitLabHttpRuntime | None] = ContextVar(
