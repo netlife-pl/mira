@@ -17,6 +17,7 @@ import pytest
 
 from mira.exceptions import ProviderError
 from mira.platforms.gitlab import http as gitlab_http
+from mira.platforms.gitlab.auth import GitLabTokenAuth
 from mira.platforms.gitlab.http import (
     GitLabHttpRuntime,
     GitLabRequestError,
@@ -1628,3 +1629,50 @@ def test_tls_failure_as_context_only_is_false() -> None:
     wrapper = httpx.ConnectError("wrapper")
     wrapper.__context__ = cert_error
     assert retryable_exception("HEAD", wrapper) is False
+
+
+# -- Task 3: identity consumer routing --------------------------------------
+
+
+async def test_auth_identity_recovers_from_503_then_200() -> None:
+    sends: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        sends.append(request)
+        if len(sends) == 1:
+            return httpx.Response(503, headers={"retry-after": "0"})
+        return httpx.Response(200, json={"username": "project_9_bot"})
+
+    runtime, _ = make_runtime(handler)
+    try:
+        async with gitlab_http_scope(runtime):
+            auth = GitLabTokenAuth("token", GITLAB_API)
+            assert await auth.get_bot_identity() == "project_9_bot"
+            # The identity is cached; no second request.
+            assert await auth.get_bot_identity() == "project_9_bot"
+    finally:
+        await runtime.aclose()
+
+    assert len(sends) == 2
+    assert sends[0].url == sends[1].url
+    assert sends[0].headers["private-token"] == "token"
+
+
+async def test_auth_identity_exhaustion_returns_none_without_partial_truth(
+    fake_clock: FakeClock,
+) -> None:
+    sends: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        sends.append(request)
+        return httpx.Response(503, headers={"retry-after": "0"})
+
+    runtime, _ = make_runtime(handler)
+    try:
+        async with gitlab_http_scope(runtime):
+            auth = GitLabTokenAuth("token", GITLAB_API)
+            assert await auth.get_bot_identity() is None
+    finally:
+        await runtime.aclose()
+
+    assert len(sends) == 5

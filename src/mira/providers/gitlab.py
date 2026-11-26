@@ -12,7 +12,7 @@ import asyncio
 import logging
 import re
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -26,6 +26,7 @@ from mira.models import (
     UnresolvedThread,
 )
 from mira.platforms import profiles
+from mira.platforms.gitlab.http import request_gitlab
 from mira.providers.base import BaseProvider
 from mira.providers.formatting import format_comment_body, format_key_issues
 
@@ -83,6 +84,14 @@ def _build_unified_diff(changes: list[dict[str, Any]]) -> str:
     return "".join(p if p.endswith("\n") else p + "\n" for p in parts)
 
 
+def _safe_target(url: str) -> str:
+    """Origin and path only — query strings and fragments are diagnostics secrets."""
+    parts = urlsplit(url)
+    if parts.scheme and parts.netloc:
+        return f"{parts.scheme}://{parts.netloc}{parts.path}"
+    return parts.path or url
+
+
 class GitLabProvider(BaseProvider):
     """GitLab code hosting provider (REST v4)."""
 
@@ -105,22 +114,22 @@ class GitLabProvider(BaseProvider):
     async def _request(
         self, method: str, url: str, *, ok: tuple[int, ...] = (200, 201), **kw: Any
     ) -> httpx.Response:
-        headers = {"PRIVATE-TOKEN": self._token, **kw.pop("headers", {})}
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.request(method, url, headers=headers, **kw)
+        resp = await request_gitlab(self._token, self._api, method, url, **kw)
         if resp.status_code not in ok:
-            raise ProviderError(f"GitLab {method} {url} → {resp.status_code}: {resp.text[:300]}")
+            # Diagnostics carry method/origin/path/status only: never the query
+            # string, request body or response body.
+            raise ProviderError(f"GitLab {method} {_safe_target(url)} → {resp.status_code}")
         return resp
 
     async def _paginate(self, url: str) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         next_url: str | None = url + ("&" if "?" in url else "?") + "per_page=100"
-        async with httpx.AsyncClient(timeout=30) as client:
-            while next_url:
-                resp = await client.get(next_url, headers={"PRIVATE-TOKEN": self._token})
-                resp.raise_for_status()
-                out.extend(resp.json())
-                next_url = _next_link(resp.headers.get("link", ""))
+        while next_url:
+            resp = await self._request("GET", next_url)
+            out.extend(resp.json())
+            # The executor validates every Link target against the configured
+            # origin/root before it can receive the token.
+            next_url = _next_link(resp.headers.get("link", ""))
         return out
 
     async def _self_username(self) -> str:
@@ -274,16 +283,15 @@ class GitLabProvider(BaseProvider):
 
         sem = asyncio.Semaphore(8)
         base = f"{self._project(pr_info)}/repository/commits"
-        headers = {"PRIVATE-TOKEN": self._token}
 
-        async def _fetch_one(
-            client: httpx.AsyncClient, path: str
-        ) -> tuple[str, list[FileHistoryEntry]]:
+        async def _fetch_one(path: str) -> tuple[str, list[FileHistoryEntry]]:
             async with sem:
                 try:
-                    resp = await client.get(
+                    resp = await request_gitlab(
+                        self._token,
+                        self._api,
+                        "GET",
                         base,
-                        headers=headers,
                         params={
                             "path": path,
                             "ref_name": pr_info.head_branch,
@@ -291,10 +299,15 @@ class GitLabProvider(BaseProvider):
                         },
                     )
                     if resp.status_code != 200:
+                        logger.warning(
+                            "GitLab file history fetch failed for %s: HTTP %d",
+                            path,
+                            resp.status_code,
+                        )
                         return path, []
                     data = resp.json()
                 except Exception as exc:
-                    logger.debug("File history fetch failed for %s: %s", path, exc)
+                    logger.warning("GitLab file history fetch failed for %s: %s", path, exc)
                     return path, []
 
             entries: list[FileHistoryEntry] = []
@@ -310,8 +323,7 @@ class GitLabProvider(BaseProvider):
                 )
             return path, entries
 
-        async with httpx.AsyncClient(timeout=30) as client:
-            results = await asyncio.gather(*[_fetch_one(client, p) for p in paths])
+        results = await asyncio.gather(*[_fetch_one(p) for p in paths])
         return {path: hist for path, hist in results if hist}
 
     # ── posting ─────────────────────────────────────────────────────

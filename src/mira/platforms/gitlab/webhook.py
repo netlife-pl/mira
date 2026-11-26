@@ -13,14 +13,14 @@ import logging
 import re
 from typing import Any
 
-import httpx
-
 from mira.config import load_config
+from mira.exceptions import ProviderError
 from mira.platforms import profiles
 from mira.platforms.auth import PlatformAuth
 from mira.platforms.base_branch_policy import base_branch_is_filtered_for_repo
 from mira.platforms.command_policy import is_command_allowed
 from mira.platforms.fetch import _next_link, make_fetcher
+from mira.platforms.gitlab.http import request_gitlab
 from mira.platforms.mentions import (
     author_is_filtered,
     has_mention,
@@ -46,16 +46,16 @@ async def list_gitlab_projects(token: str, base_url: str) -> list[dict[str, Any]
     url: str | None = (
         f"{base_url.rstrip('/')}/projects?membership=true&simple=true&active=true&per_page=100"
     )
-    async with httpx.AsyncClient(timeout=30) as client:
-        while url:
-            resp = await client.get(url, headers={"PRIVATE-TOKEN": token})
-            if resp.status_code != 200:
-                logger.warning(
-                    "GitLab project list failed: %d %s", resp.status_code, resp.text[:200]
-                )
-                break
-            out.extend(resp.json())
-            url = _next_link(resp.headers.get("link", ""))
+    while url:
+        # The shared executor retries retryable statuses and validates every
+        # Link target against the configured origin/root before sending.
+        resp = await request_gitlab(token, base_url, "GET", url)
+        if resp.status_code != 200:
+            # Exhaustion or a terminal response must not surface as a
+            # successful prefix of the project list.
+            raise ProviderError(f"GitLab project list failed: HTTP {resp.status_code}")
+        out.extend(resp.json())
+        url = _next_link(resp.headers.get("link", ""))
     return out
 
 

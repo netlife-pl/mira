@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import httpx
+from mira.platforms.gitlab.http import GitLabRequestError, request_gitlab
 
 
 class GitLabTokenAuth:
@@ -18,17 +18,21 @@ class GitLabTokenAuth:
         return self._token
 
     async def get_bot_identity(self) -> str | None:
-        """The token user's username, via ``GET /user`` (cached)."""
+        """The token user's username, via ``GET /user`` (cached).
+
+        Exhausted retries leave the identity unknown (``None``); they are never
+        reported as a successful lookup.
+        """
         if self._username_fetched:
             return self._username
         self._username_fetched = True
-        headers = {"PRIVATE-TOKEN": self._token}
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(f"{self._base_url}/user", headers=headers, timeout=10.0)
-                if resp.status_code == 200:
-                    username = resp.json().get("username")
-                    self._username = username if isinstance(username, str) and username else None
-        except (httpx.HTTPError, ValueError):
+            resp = await request_gitlab(
+                self._token, self._base_url, "GET", f"{self._base_url}/user"
+            )
+            if resp.status_code == 200:
+                username = resp.json().get("username")
+                self._username = username if isinstance(username, str) and username else None
+        except (GitLabRequestError, ValueError):
             self._username = None
         return self._username
