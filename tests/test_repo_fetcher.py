@@ -289,7 +289,10 @@ async def _gitlab_scope(handler):
         client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
     )
     async with gitlab_http_scope(runtime):
-        yield runtime
+        try:
+            yield runtime
+        finally:
+            await runtime.aclose()
 
 
 def _adapt(supply):
@@ -1269,10 +1272,13 @@ class TestGitLabExecutorIntegration:
 
         runtime = GitLabHttpRuntime(client_factory=factory)
         async with gitlab_http_scope(runtime):
-            fetcher = GitLabRepoFetcher("t")
-            assert await fetcher.repo_tree("g", "p", "main") == ["a.py"]
-            assert await fetcher.file_content("g", "p", "a.py", "main") == "x"
-            assert await fetcher.repo_tarball("g", "p", "main") == {"a.py": "x"}
+            try:
+                fetcher = GitLabRepoFetcher("t")
+                assert await fetcher.repo_tree("g", "p", "main") == ["a.py"]
+                assert await fetcher.file_content("g", "p", "a.py", "main") == "x"
+                assert await fetcher.repo_tarball("g", "p", "main") == {"a.py": "x"}
+            finally:
+                await runtime.aclose()
 
         assert requests == [
             "/api/v4/projects/g%2Fp/repository/tree",

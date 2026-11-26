@@ -68,7 +68,10 @@ class _RoutedClient:
 async def _patch(handler):
     runtime = GitLabHttpRuntime(client_factory=lambda: _RoutedClient(handler))
     async with gitlab_http_scope(runtime):
-        yield runtime
+        try:
+            yield runtime
+        finally:
+            await runtime.aclose()
 
 
 @asynccontextmanager
@@ -78,7 +81,10 @@ async def _mock_scope(handler):
         client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
     )
     async with gitlab_http_scope(runtime):
-        yield runtime
+        try:
+            yield runtime
+        finally:
+            await runtime.aclose()
 
 
 _PR = PRInfo(

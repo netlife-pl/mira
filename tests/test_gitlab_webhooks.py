@@ -35,6 +35,16 @@ def fast_gitlab_retries(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(gitlab_http, "_sleep", _sleep)
 
 
+class _ManualClock:
+    """Deterministic monotonic clock; sleeps are released by the test."""
+
+    def __init__(self, start: float = 1_000_000.0) -> None:
+        self.now = start
+
+    def time(self) -> float:
+        return self.now
+
+
 @pytest.fixture
 def gitlab_auth():  # noqa: ANN201
     auth = GitLabTokenAuth("tok")
@@ -421,7 +431,10 @@ async def _patch_gitlab_http(projects, *, requests=None):
         )
     )
     async with gitlab_http_scope(runtime):
-        yield runtime
+        try:
+            yield runtime
+        finally:
+            await runtime.aclose()
 
 
 @pytest.fixture
@@ -483,7 +496,10 @@ async def test_discovery_recovers_from_retryable_status(gitlab_project_list, sta
         client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
     )
     async with gitlab_http_scope(runtime):
-        projects = await gw.list_gitlab_projects("tok", "https://gitlab.com/api/v4")
+        try:
+            projects = await gw.list_gitlab_projects("tok", "https://gitlab.com/api/v4")
+        finally:
+            await runtime.aclose()
 
     assert [p["path_with_namespace"] for p in projects] == [
         "netlife/wfp",
@@ -496,34 +512,65 @@ async def test_discovery_recovers_from_retryable_status(gitlab_project_list, sta
 
 @pytest.mark.asyncio
 async def test_discovery_exhaustion_raises_not_partial_prefix(fast_gitlab_retries):
+    """A successful page 1 must not be returned when page 2 exhausts."""
     from mira.platforms.gitlab import webhook as gw
 
     requests: list[httpx.Request] = []
+    statuses: list[int] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return httpx.Response(503, headers={"retry-after": "0"})
+        if request.url.params.get("page") == "2":
+            statuses.append(503)
+            return httpx.Response(503, headers={"retry-after": "0"})
+        statuses.append(200)
+        next_url = f"{request.url}&page=2"
+        return httpx.Response(
+            200,
+            json=[{"path_with_namespace": "netlife/wfp", "visibility": "private"}],
+            headers={"link": f'<{next_url}>; rel="next"'},
+        )
 
     runtime = GitLabHttpRuntime(
         client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
     )
     async with gitlab_http_scope(runtime):
-        with pytest.raises(GitLabRequestError) as excinfo:
-            await gw.list_gitlab_projects("tok", "https://gitlab.com/api/v4")
+        try:
+            with pytest.raises(GitLabRequestError) as excinfo:
+                await gw.list_gitlab_projects("tok", "https://gitlab.com/api/v4")
+        finally:
+            await runtime.aclose()
 
     assert excinfo.value.attempts == 5
-    assert len(requests) == 5
+    # Page 1 succeeds, then page 2 is retried five times without a prefix result.
+    assert statuses == [200, 503, 503, 503, 503, 503]
+    assert len(requests) == 6
+    assert all(request.url.params.get("page") == "2" for request in requests[1:])
+    assert len({str(request.url) for request in requests[1:]}) == 1
 
 
 @pytest.mark.asyncio
-async def test_discovery_429_gates_concurrent_provider_request():
-    """A discovery throttle is shared with provider calls on the same token."""
+async def test_discovery_429_gates_concurrent_provider_request(monkeypatch: pytest.MonkeyPatch):
+    """A discovery throttle is shared with provider calls on the same token.
+
+    A manual monotonic clock plus per-sleep release events make the gate wait
+    deterministic: no real sleeping and no wall-clock assertions.
+    """
     from mira.platforms.gitlab import webhook as gw
     from mira.providers.gitlab import GitLabProvider
 
-    loop = asyncio.get_running_loop()
-    discovery_sent = asyncio.Event()
-    times: dict[str, float] = {}
+    clock = _ManualClock()
+    sleep_calls: asyncio.Queue[tuple[float, asyncio.Event]] = asyncio.Queue()
+
+    async def fake_sleep(seconds: float) -> None:
+        release = asyncio.Event()
+        sleep_calls.put_nowait((seconds, release))
+        await release.wait()
+        clock.now += seconds
+
+    monkeypatch.setattr(gitlab_http, "_monotonic", clock.time)
+    monkeypatch.setattr(gitlab_http, "_sleep", fake_sleep)
+
     discovery_sends = 0
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -531,11 +578,8 @@ async def test_discovery_429_gates_concurrent_provider_request():
         if request.url.path.endswith("/projects"):
             discovery_sends += 1
             if discovery_sends == 1:
-                times["discovery"] = loop.time()
-                discovery_sent.set()
-                return httpx.Response(429, headers={"retry-after": "0.05"})
+                return httpx.Response(429, headers={"retry-after": "5"})
             return httpx.Response(200, json=[])
-        times["provider"] = loop.time()
         return httpx.Response(200, json={"username": "bot"})
 
     clients: list[httpx.AsyncClient] = []
@@ -548,21 +592,26 @@ async def test_discovery_429_gates_concurrent_provider_request():
     runtime = GitLabHttpRuntime(client_factory=factory)
     provider = GitLabProvider("tok")
     async with gitlab_http_scope(runtime):
-        discovery = asyncio.create_task(gw.list_gitlab_projects("tok", "https://gitlab.com/api/v4"))
-        await discovery_sent.wait()
-        # Wait until the executor has recorded the shared cooldown, not merely
-        # until the 429 response was sent.
-        state = next(iter(runtime._states.values()))
-        for _ in range(500):
-            if state.cooldown_not_before > loop.time():
-                break
-            await asyncio.sleep(0)
-        else:
-            raise AssertionError("shared cooldown was never recorded")
-        result = await provider._request("GET", f"{provider._api}/user")
-        projects = await discovery
+        try:
+            discovery = asyncio.create_task(
+                gw.list_gitlab_projects("tok", "https://gitlab.com/api/v4")
+            )
+            # The executor records the cooldown before entering its retry sleep.
+            discovery_delay, release_discovery = await sleep_calls.get()
+            assert discovery_delay == 5.0
+
+            gate_wait = asyncio.create_task(provider._request("GET", f"{provider._api}/user"))
+            # The sibling provider request must wait out the shared cooldown.
+            provider_delay, release_provider = await sleep_calls.get()
+            assert provider_delay == 5.0
+
+            release_provider.set()
+            result = await gate_wait
+            release_discovery.set()
+            projects = await discovery
+        finally:
+            await runtime.aclose()
 
     assert result.json()["username"] == "bot"
     assert projects == []
     assert len(clients) == 1
-    assert times["provider"] >= times["discovery"] + 0.04

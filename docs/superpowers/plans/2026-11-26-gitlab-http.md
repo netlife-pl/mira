@@ -252,25 +252,43 @@ checklist with verified results, not assumptions.
 
 **Interfaces consumed:** Completed runtime and consumer integration.
 
-- [ ] Add a loopback HTTP/1.1 keep-alive server fixture with deterministic cleanup,
+- [x] Add a loopback HTTP/1.1 keep-alive server fixture with deterministic cleanup,
   correct Content-Length and a connection counter; no external service.
   Write a sequential cross-job test asserting two requests use one TCP
   connection, and a concurrent test asserting no more than eight connections.
   Disable environment proxies for the loopback client's injected factory.
-- [ ] Run the new tests against the baseline/old client-per-call path and observe
+  (`tests/test_gitlab_http_pool.py`: threaded `ThreadingHTTPServer`,
+  `protocol_version="HTTP/1.1"`, explicit `Content-Length`, per-connection
+  counter, tracked sockets closed on teardown; injected clients set
+  `trust_env=False` and the production 8/8/30 limits.)
+- [x] Run the new tests against the baseline/old client-per-call path and observe
   the expected reuse assertion fail; then run against the new shared runtime
   and require pass. Client identity mocks alone are not sufficient evidence.
-- [ ] Run `uv run --frozen --extra dev --extra serve --extra bedrock pytest -q`.
+  (RED: `MIRA_GITLAB_HTTP_POOL_LEGACY_CONTROL=1 uv run --frozen --extra dev
+  pytest tests/test_gitlab_http_pool.py -q` → 1 failed:
+  `assert connections == 1` / `assert 2 == 1`; GREEN default run → 3 passed.)
+- [x] Run `uv run --frozen --extra dev --extra serve --extra bedrock pytest -q`.
   Include the optional Bedrock dependency so its previously observed missing-boto3
   failure does not obscure regressions. Record unrelated failures separately.
-- [ ] Run Ruff check/format-check on changed Python files using
+  (2924 passed, 79 skipped, 39 deselected, 21 warnings in 133.29s; no failures.
+  Passed count exceeds the pre-Task-1 baseline of 2645 because Tasks 1–5 added
+  tests; warning count matches the baseline's 21.)
+- [x] Run Ruff check/format-check on changed Python files using
   `uv run --frozen --extra dev ruff check <changed-python-files>` and
   `uv run --frozen --extra dev ruff format --check <changed-python-files>`.
-- [ ] Search GitLab consumers for remaining AsyncClient/direct GET calls and
+  (Both clean on `tests/test_gitlab_http_pool.py`, `tests/test_gitlab_webhooks.py`,
+  `tests/test_gitlab_provider.py`, `tests/test_repo_fetcher.py`.)
+- [x] Search GitLab consumers for remaining AsyncClient/direct GET calls and
   verify every GitLab path uses the executor; other platforms remain unchanged.
   Review the complete diff for duplicated retries, unsafe write replay, secret
   logging, missing cleanup and sleep-with-permit-held races.
-- [ ] Commit: `test(gitlab): verify shared pool and retry integration`.
+  (GitLab provider/fetcher/auth/discovery all call `request_gitlab`; only
+  `gitlab/http.py` constructs clients. Remaining `AsyncClient` calls belong to
+  GitHub/Bitbucket/Forgejo/LLM/OSV/dashboard paths and are unchanged. Diff
+  review found no duplicated retry loop, no automatic write replay beyond 429
+  replayable bodies, no token/query/body logging, and permits are released in a
+  `finally` before sleeps.)
+- [x] Commit: `test(gitlab): verify shared pool and retry integration`.
 - [ ] Request fresh read-only whole-branch review against the spec and tests.
   Fix verified findings with focused failing-first regressions.
 - [ ] Push a new `ai/gitlab-shared-http` implementation branch and open a PR
