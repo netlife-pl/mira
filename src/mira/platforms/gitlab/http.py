@@ -335,6 +335,16 @@ async def _close_for_retry(response: httpx.Response) -> None:
         logger.debug("Failed to close a retried GitLab response", exc_info=True)
 
 
+async def _close_client_safely(client: httpx.AsyncClient) -> None:
+    """Close one pooled client, retaining cancellation for the caller."""
+    try:
+        await client.aclose()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("Failed to close a pooled GitLab client", exc_info=True)
+
+
 async def _wait_for_gate(state: _EndpointState, deadline: float, attempts: int) -> None:
     """Sleep outside any permit until the shared cooldown has elapsed."""
     while True:
@@ -416,6 +426,7 @@ class GitLabHttpRuntime:
         self._states: dict[tuple[str, str, int, str, str], _EndpointState] = {}
         self._closed = False
         self._pending_clients: list[httpx.AsyncClient] = []
+        self._inflight_cleanups: dict[httpx.AsyncClient, asyncio.Task[None]] = {}
         self._close_lock = asyncio.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -620,35 +631,40 @@ class GitLabHttpRuntime:
 
     async def aclose(self) -> None:
         """Close pooled clients once; interrupted cleanup resumes on the next call."""
-        if self._closed and not self._pending_clients:
+        if self._closed and not self._pending_clients and not self._inflight_cleanups:
             return
         loop = asyncio.get_running_loop()
         if self._loop is not None and self._loop is not loop:
             raise RuntimeError("GitLabHttpRuntime cannot be closed from a different event loop")
         self._closed = True
         async with self._close_lock:
-            if not self._pending_clients:
-                self._pending_clients.extend(
-                    state.client for state in self._states.values() if state.client is not None
-                )
+            if not self._pending_clients and not self._inflight_cleanups:
                 for state in self._states.values():
+                    if state.client is not None:
+                        self._pending_clients.append(state.client)
                     state.client = None
-            index = 0
-            while index < len(self._pending_clients):
-                client = self._pending_clients[index]
+            while self._pending_clients or self._inflight_cleanups:
+                if not self._inflight_cleanups:
+                    client = self._pending_clients.pop(0)
+                    # One retained cleanup task per client. HTTPX marks the
+                    # client closed before transport cleanup finishes, so a
+                    # later aclose() must await this exact task again instead
+                    # of starting another client.aclose().
+                    self._inflight_cleanups[client] = asyncio.create_task(
+                        _close_client_safely(client)
+                    )
+                client, cleanup = next(iter(self._inflight_cleanups.items()))
                 cancelled = False
                 try:
-                    # Shield so an interrupted teardown leaves the client
-                    # pending for the next aclose() instead of losing it.
-                    await asyncio.shield(client.aclose())
+                    # Shield so an interrupted teardown cannot cancel the
+                    # retained cleanup task.
+                    await asyncio.shield(cleanup)
                 except asyncio.CancelledError:
                     cancelled = True
                     raise
-                except Exception:
-                    logger.debug("Failed to close a pooled GitLab client", exc_info=True)
                 finally:
                     if not cancelled:
-                        del self._pending_clients[index]
+                        del self._inflight_cleanups[client]
 
 
 _RUNTIME_CONTEXT: ContextVar[GitLabHttpRuntime | None] = ContextVar(

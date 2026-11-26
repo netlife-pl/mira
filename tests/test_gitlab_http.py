@@ -269,6 +269,28 @@ class NonSeekableStream:
         return self._payload
 
 
+class BlockedCloseTransport(httpx.MockTransport):
+    """A real transport whose ``aclose`` blocks until the test releases it."""
+
+    def __init__(
+        self,
+        handler,
+        *,
+        entered: asyncio.Event,
+        resume: asyncio.Event,
+        completed: asyncio.Event,
+    ) -> None:
+        super().__init__(handler)
+        self._entered = entered
+        self._resume = resume
+        self._completed = completed
+
+    async def aclose(self) -> None:
+        self._entered.set()
+        await self._resume.wait()
+        self._completed.set()
+
+
 def make_runtime(handler, *, policy: GitLabRetryPolicy | None = None):
     created: list[httpx.AsyncClient] = []
 
@@ -1145,6 +1167,64 @@ async def test_aclose_resumes_after_cancellation_with_multiple_clients() -> None
         resume.set()
         await wait_until(lambda: created[0].is_closed, what="shielded client close")
         await runtime.aclose()
+        assert created[0].is_closed is True
+        assert created[1].is_closed is True
+    finally:
+        resume.set()
+        await runtime.aclose()
+
+
+async def test_aclose_retry_awaits_same_transport_cleanup() -> None:
+    entered = asyncio.Event()
+    resume = asyncio.Event()
+    completed = asyncio.Event()
+
+    created: list[httpx.AsyncClient] = []
+
+    def factory() -> httpx.AsyncClient:
+        if not created:
+            transport = BlockedCloseTransport(
+                ok_handler, entered=entered, resume=resume, completed=completed
+            )
+        else:
+            transport = httpx.MockTransport(ok_handler)
+        client = httpx.AsyncClient(transport=transport, follow_redirects=False)
+        created.append(client)
+        return client
+
+    runtime = GitLabHttpRuntime(client_factory=factory)
+    try:
+        await runtime.request("token-a", GITLAB_API, "GET", f"{GITLAB_API}/a")
+        await runtime.request(
+            "token-b",
+            "https://other.example.com/api/v4",
+            "GET",
+            "https://other.example.com/api/v4/b",
+        )
+        assert len(created) == 2
+
+        closing = asyncio.create_task(runtime.aclose(), name="first-close")
+        await entered.wait()
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+
+        # Retry immediately, without releasing the blocked transport cleanup.
+        # It must await the retained cleanup task instead of starting a second
+        # client.aclose() that returns because HTTPX already marked the client
+        # closed.
+        retry = asyncio.create_task(runtime.aclose(), name="retry-close")
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if created[1].is_closed:
+                break
+        assert retry.done() is False
+        assert completed.is_set() is False
+        assert created[1].is_closed is False
+
+        resume.set()
+        await wait_until(lambda: completed.is_set(), what="blocked transport cleanup")
+        await retry
         assert created[0].is_closed is True
         assert created[1].is_closed is True
     finally:
