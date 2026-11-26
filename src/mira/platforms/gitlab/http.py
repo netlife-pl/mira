@@ -412,6 +412,40 @@ async def _enter_endpoint(state: _EndpointState, deadline: float, attempts: int)
         state.semaphore.release()
 
 
+class _RedactGitLabRequestQuery(logging.Filter):
+    """Strip query/fragment from HTTPX's own request-line log.
+
+    HTTPX logs ``request.url`` through the shared ``httpx`` logger, so the
+    executor cannot sanitize that message per client. This filter is keyed on a
+    ContextVar that is set only while a GitLab runtime is inside
+    ``client.send``, leaving every other platform's diagnostics untouched and
+    never mutating logger levels.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not _GITLAB_SEND_ACTIVE.get():
+            return True
+        args = record.args
+        if not isinstance(args, tuple) or len(args) < 2:
+            return True
+        raw = args[1]
+        try:
+            url = raw if isinstance(raw, httpx.URL) else httpx.URL(str(raw))
+        except (TypeError, ValueError):
+            return True
+        if not url.query and not url.fragment:
+            return True
+        # ``raw_path`` keeps percent-encoding intact (unlike ``url.path``).
+        raw_path = url.raw_path.split(b"?", 1)[0].decode("ascii", "replace")
+        safe = f"{url.scheme}://{url.netloc.decode('ascii', 'replace')}{raw_path}"
+        record.args = (args[0], safe, *args[2:])
+        return True
+
+
+_GITLAB_SEND_ACTIVE: ContextVar[bool] = ContextVar("mira_gitlab_http_send_active", default=False)
+logging.getLogger("httpx").addFilter(_RedactGitLabRequestQuery())
+
+
 class GitLabHttpRuntime:
     """Own pooled clients, request slots and shared throttle cooldowns."""
 
@@ -476,11 +510,17 @@ class GitLabHttpRuntime:
         remaining = deadline - _monotonic()
         if remaining <= 0:
             raise GitLabRequestError("overall deadline exceeded", attempts)
+        # Mark this task's HTTPX request-line log records as in-scope for query
+        # redaction; reset on every exit path, including cancellation.
+        token = _GITLAB_SEND_ACTIVE.set(True)
         try:
-            async with asyncio.timeout(remaining):
-                return await client.send(request, follow_redirects=False, stream=False)
-        except TimeoutError:
-            raise GitLabRequestError("overall deadline exceeded", attempts) from None
+            try:
+                async with asyncio.timeout(remaining):
+                    return await client.send(request, follow_redirects=False, stream=False)
+            except TimeoutError:
+                raise GitLabRequestError("overall deadline exceeded", attempts) from None
+        finally:
+            _GITLAB_SEND_ACTIVE.reset(token)
 
     @staticmethod
     def _record_503_cooldown(state: _EndpointState, response: httpx.Response) -> None:

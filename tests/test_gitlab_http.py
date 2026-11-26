@@ -1676,3 +1676,50 @@ async def test_auth_identity_exhaustion_returns_none_without_partial_truth(
         await runtime.aclose()
 
     assert len(sends) == 5
+
+
+# -- Task 3 review: HTTPX's own request-line log must not leak queries --------
+
+
+async def test_httpx_info_log_redacts_gitlab_query(caplog: pytest.LogCaptureFixture) -> None:
+    """Normal root/httpx INFO capture must not see the sensitive query."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True})
+
+    runtime, _ = make_runtime(handler)
+    try:
+        with caplog.at_level(logging.INFO):
+            await runtime.request(
+                "super-secret-token",
+                GITLAB_API,
+                "GET",
+                f"{GITLAB_API}/projects/p%2Fq/merge_requests/1?private_token=query-secret",
+            )
+    finally:
+        await runtime.aclose()
+
+    text = caplog.text
+    assert "HTTP Request" in text
+    assert "/api/v4/projects/p%2Fq/merge_requests/1" in text
+    assert "query-secret" not in text
+    assert "private_token" not in text
+    assert "super-secret-token" not in text
+
+
+async def test_httpx_info_log_leaves_unrelated_platform_queries(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Sanitization is scoped to GitLab executor sends only."""
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with caplog.at_level(logging.INFO):
+            await client.get("https://other.example.invalid/tree?keep=visible")
+
+    assert len(requests) == 1
+    assert "keep=visible" in caplog.text
