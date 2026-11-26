@@ -536,6 +536,15 @@ async def _run_initial_indexing(default_mode: str) -> None:
     repos = _app_db.list_repos()
     to_index = [r for r in repos if r.index_mode != "none" and r.status in ("pending", "indexing")]
 
+    # This task was spawned by a request whose runtime binding we inherited;
+    # register it with that owner only when the real batch can use GitLab HTTP.
+    # Determining ownership here (rather than from the setup request body)
+    # covers GitLab repos that were already pending in the database.
+    if any(repo.platform == "gitlab" for repo in to_index):
+        from mira.platforms.gitlab.background import track_current
+
+        track_current()
+
     if not to_index:
         return
 

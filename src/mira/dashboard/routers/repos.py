@@ -587,7 +587,12 @@ async def trigger_index(owner: str, repo: str, request: Request, full: bool = Fa
             if store is not None:
                 store.close()
 
-    asyncio.create_task(_do_index())
+    if platform == "gitlab":
+        from mira.platforms.gitlab.background import spawn as spawn_gitlab_job
+
+        spawn_gitlab_job(_do_index(), request=request)
+    else:
+        asyncio.create_task(_do_index())
     return {"status": "indexing", "full": full}
 
 

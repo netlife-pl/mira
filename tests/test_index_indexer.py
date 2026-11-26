@@ -24,6 +24,7 @@ from mira.index.indexer import (
 )
 from mira.index.store import IndexStore
 from mira.llm import create_llm
+from mira.platforms.gitlab.http import GitLabRequestError
 
 
 class TestShouldIndex:
@@ -448,6 +449,107 @@ class TestIndexRepo:
         assert count == 0
         mock_llm.complete.assert_not_called()
         store.close()
+
+
+class _FailAfterSiblingsFetcher:
+    """One fetch fails only after its siblings are blocked in file_content."""
+
+    def __init__(self, fail_path="bad.py", blocked=("a.py", "b.py")):
+        self.fail_path = fail_path
+        self.blocked = list(blocked)
+        self.started: list[str] = []
+        self.cleaned: list[str] = []
+        self.siblings_started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def default_branch(self, owner, repo):
+        return "main"
+
+    async def repo_tree(self, owner, repo, branch):
+        return [*self.blocked, self.fail_path]
+
+    async def repo_tarball(self, *args, **kwargs):
+        return None
+
+    async def file_content(self, owner, repo, path, ref, semaphore=None):
+        if path == self.fail_path:
+            # Fail only once every sibling is known to be in flight.
+            await self.siblings_started.wait()
+        else:
+            self.started.append(path)
+            if len(self.started) >= len(self.blocked):
+                self.siblings_started.set()
+        try:
+            await self.release.wait()
+        finally:
+            self.cleaned.append(path)
+        if path == self.fail_path:
+            raise GitLabRequestError("exhausted retries (HTTP 503)", 5, 503)
+        return f"# {path}\n"
+
+
+async def _run_index_diff(tmp_path, fetcher):
+    store = IndexStore(str(tmp_path / "index-diff.db"))
+    try:
+        await index_diff(
+            owner="test",
+            repo="repo",
+            config=MiraConfig(),
+            store=store,
+            llm=AsyncMock(),
+            changed_paths=["a.py", "b.py", "bad.py"],
+            fetcher=fetcher,
+        )
+    finally:
+        store.close()
+
+
+async def _run_index_repo(tmp_path, fetcher):
+    store = IndexStore(str(tmp_path / "index-repo.db"))
+    try:
+        await index_repo(
+            owner="test",
+            repo="repo",
+            config=MiraConfig(),
+            store=store,
+            llm=AsyncMock(),
+            full=True,
+            fetcher=fetcher,
+            tree_paths=["a.py", "b.py", "bad.py"],
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runner", [_run_index_diff, _run_index_repo])
+async def test_failed_fetch_drains_blocked_siblings_before_raising(tmp_path, runner):
+    """A batch failure cancels and awaits outstanding child fetches.
+
+    Without this, the parent job returns/fails while sibling requests still
+    hold pooled connections and semaphore permits.
+    """
+    fetcher = _FailAfterSiblingsFetcher()
+    task = asyncio.create_task(runner(tmp_path, fetcher))
+    await asyncio.wait_for(fetcher.siblings_started.wait(), 5)
+    fetcher.release.set()
+    with pytest.raises(GitLabRequestError):
+        await task
+
+    assert set(fetcher.started) == {"a.py", "b.py"}
+    assert set(fetcher.cleaned) == {"a.py", "b.py", "bad.py"}
+
+
+@pytest.mark.asyncio
+async def test_parent_cancellation_drains_file_fetch_siblings(tmp_path):
+    fetcher = _FailAfterSiblingsFetcher()
+    task = asyncio.create_task(_run_index_diff(tmp_path, fetcher))
+    await asyncio.wait_for(fetcher.siblings_started.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert set(fetcher.cleaned) == {"a.py", "b.py", "bad.py"}
 
 
 @pytest.mark.asyncio

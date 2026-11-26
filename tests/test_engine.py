@@ -21,7 +21,7 @@ from mira.core.engine import (
     _restrict_diff_to_paths,
     _security_relevant_files,
 )
-from mira.core.threads import _extract_sections
+from mira.core.threads import _extract_sections, resolve_verified_threads
 from mira.exceptions import ProviderError
 from mira.llm.provider import LLMProvider
 from mira.models import (
@@ -37,6 +37,7 @@ from mira.models import (
     WalkthroughConfidenceScore,
     WalkthroughResult,
 )
+from mira.platforms.gitlab.http import GitLabRequestError
 
 
 def _empty_filediff(path: str) -> FileDiff:
@@ -1746,6 +1747,176 @@ class TestThreadResolution:
         # Review should still complete
         assert result is not None
         mock_provider.get_pr_diff.assert_awaited_once()
+
+
+class TestThreadVerificationUnavailablePaths:
+    """An exhausted source fetch excludes its path without hiding the rest."""
+
+    @pytest.fixture
+    def pr_info(self) -> PRInfo:
+        return PRInfo(
+            title="Test PR",
+            description="",
+            base_branch="main",
+            head_branch="feature",
+            url="https://gitlab.com/g/p/-/merge_requests/1",
+            number=1,
+            owner="g",
+            repo="p",
+            platform="gitlab",
+        )
+
+    @staticmethod
+    def _llm() -> MagicMock:
+        llm = MagicMock(spec=LLMProvider)
+        llm.count_tokens = MagicMock(return_value=100)
+        llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        llm.complete = AsyncMock(
+            return_value=json.dumps({"results": [{"id": "T1", "fixed": True}]})
+        )
+        return llm
+
+    @pytest.mark.asyncio
+    async def test_exhausted_path_is_excluded_but_other_path_resolves(self, pr_info):
+        threads = [
+            UnresolvedThread(thread_id="T1", path="src/app.py", line=10, body="secret"),
+            UnresolvedThread(thread_id="T2", path="src/gone.py", line=3, body="null check"),
+        ]
+        provider = AsyncMock()
+        provider.get_unresolved_bot_threads = AsyncMock(return_value=threads)
+
+        async def _content(pr, path, ref):
+            if path == "src/gone.py":
+                raise GitLabRequestError("exhausted retries (HTTP 503)", 5, 503)
+            return "line1\nline2\n"
+
+        provider.get_file_content = AsyncMock(side_effect=_content)
+        provider.resolve_threads = AsyncMock(return_value=1)
+        llm = self._llm()
+
+        checked, resolved, remaining, decisions = await resolve_verified_threads(
+            provider, llm, pr_info, "mira", dry_run=False
+        )
+
+        prompt = llm.complete.call_args.args[0][1]["content"]
+        assert "src/app.py" in prompt
+        assert "src/gone.py" not in prompt
+        assert checked == 1
+        assert resolved == 1
+        assert [t.thread_id for t in remaining] == ["T2"]
+        assert {d.thread_id: d.fixed for d in decisions} == {"T1": True, "T2": False}
+        provider.resolve_threads.assert_awaited_once_with(pr_info, ["T1"])
+
+    @pytest.mark.asyncio
+    async def test_llm_ids_without_readable_source_cannot_resolve(self, pr_info):
+        threads = [
+            UnresolvedThread(thread_id="T1", path="src/app.py", line=10, body="secret"),
+            UnresolvedThread(thread_id="T2", path="src/gone.py", line=3, body="null check"),
+        ]
+        provider = AsyncMock()
+        provider.get_unresolved_bot_threads = AsyncMock(return_value=threads)
+
+        async def _content(pr, path, ref):
+            if path == "src/gone.py":
+                raise GitLabRequestError("exhausted retries (HTTP 503)", 5, 503)
+            return "line1\n"
+
+        provider.get_file_content = AsyncMock(side_effect=_content)
+        provider.resolve_threads = AsyncMock(return_value=1)
+        llm = self._llm()
+        llm.complete = AsyncMock(
+            return_value=json.dumps(
+                {
+                    "results": [
+                        {"id": "T1", "fixed": True},
+                        {"id": "T2", "fixed": True},
+                        {"id": "GHOST", "fixed": True},
+                    ]
+                }
+            )
+        )
+
+        checked, resolved, remaining, decisions = await resolve_verified_threads(
+            provider, llm, pr_info, "mira", dry_run=False
+        )
+
+        # Only the readable thread may be resolved; the model's claims about
+        # the exhausted path and an unknown id are discarded.
+        assert checked == 1
+        assert resolved == 1
+        provider.resolve_threads.assert_awaited_once_with(pr_info, ["T1"])
+        assert [t.thread_id for t in remaining] == ["T2"]
+        assert {d.thread_id: d.fixed for d in decisions} == {"T1": True, "T2": False}
+
+    @pytest.mark.asyncio
+    async def test_all_paths_exhausted_skips_the_llm(self, pr_info):
+        threads = [UnresolvedThread(thread_id="T1", path="src/app.py", line=10, body="secret")]
+        provider = AsyncMock()
+        provider.get_unresolved_bot_threads = AsyncMock(return_value=threads)
+        provider.get_file_content = AsyncMock(
+            side_effect=GitLabRequestError("exhausted retries (HTTP 503)", 5, 503)
+        )
+        provider.resolve_threads = AsyncMock(return_value=0)
+        llm = self._llm()
+
+        checked, resolved, remaining, decisions = await resolve_verified_threads(
+            provider, llm, pr_info, "mira", dry_run=False
+        )
+
+        llm.complete.assert_not_called()
+        assert (checked, resolved) == (0, 0)
+        assert [t.thread_id for t in remaining] == ["T1"]
+        assert len(decisions) == 1
+        assert decisions[0].thread_id == "T1" and decisions[0].fixed is False
+
+    @pytest.mark.asyncio
+    async def test_terminal_source_rejection_is_not_verified_as_empty(self, pr_info):
+        """A terminal 401/403 rejection leaves the thread unresolved.
+
+        It must never become an empty source submitted to the LLM: an empty
+        file can look "fixed" and get the thread resolved.
+        """
+        threads = [UnresolvedThread(thread_id="T1", path="src/app.py", line=10, body="secret")]
+        provider = AsyncMock()
+        provider.get_unresolved_bot_threads = AsyncMock(return_value=threads)
+        provider.get_file_content = AsyncMock(
+            side_effect=GitLabRequestError("GitLab GET src/app.py → 401", 1, 401)
+        )
+        provider.resolve_threads = AsyncMock(return_value=0)
+        llm = self._llm()
+
+        checked, resolved, remaining, decisions = await resolve_verified_threads(
+            provider, llm, pr_info, "mira", dry_run=False
+        )
+
+        llm.complete.assert_not_called()
+        assert (checked, resolved) == (0, 0)
+        assert [t.thread_id for t in remaining] == ["T1"]
+        provider.resolve_threads.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_file_404_is_still_submitted_and_counted(self, pr_info):
+        threads = [
+            UnresolvedThread(thread_id="T1", path="src/app.py", line=10, body="secret"),
+            UnresolvedThread(thread_id="T2", path="src/gone.py", line=3, body="null check"),
+        ]
+        provider = AsyncMock()
+        provider.get_unresolved_bot_threads = AsyncMock(return_value=threads)
+        provider.get_file_content = AsyncMock(return_value="")
+        provider.resolve_threads = AsyncMock(return_value=0)
+        llm = self._llm()
+        llm.complete = AsyncMock(return_value=json.dumps({"results": []}))
+
+        checked, resolved, remaining, decisions = await resolve_verified_threads(
+            provider, llm, pr_info, "mira", dry_run=False
+        )
+
+        prompt = llm.complete.call_args.args[0][1]["content"]
+        assert "src/app.py" in prompt and "src/gone.py" in prompt
+        assert checked == 2
+        assert resolved == 0
+        assert {t.thread_id for t in remaining} == {"T1", "T2"}
+        assert all(not d.fixed for d in decisions)
 
 
 class TestShortThreadDescription:

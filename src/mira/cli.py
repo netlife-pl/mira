@@ -6,7 +6,9 @@ import asyncio
 import json
 import logging
 import sys
+from collections.abc import Awaitable
 from datetime import UTC
+from typing import Any
 
 import click
 
@@ -17,6 +19,13 @@ from mira.core.git_snapshot import GitSnapshot
 from mira.exceptions import MiraError
 from mira.llm import create_llm
 from mira.models import ReviewResult, Severity
+from mira.platforms.gitlab.http import gitlab_http_scope
+
+
+async def _run_in_gitlab_scope(awaitable: Awaitable[Any]) -> Any:
+    """Own one GitLab runtime for the duration of a CLI invocation."""
+    async with gitlab_http_scope():
+        return await awaitable
 
 
 def _format_text(result: ReviewResult) -> str:
@@ -253,12 +262,16 @@ def review(
 
     try:
         if snapshot is not None:
-            result = asyncio.run(engine.review_diff(local_diff, local_snapshot=snapshot))
+            result = asyncio.run(
+                _run_in_gitlab_scope(engine.review_diff(local_diff, local_snapshot=snapshot))
+            )
         elif use_stdin:
             diff_text = sys.stdin.read()
-            result = asyncio.run(engine.review_diff(diff_text))
+            result = asyncio.run(_run_in_gitlab_scope(engine.review_diff(diff_text)))
         else:
-            result = asyncio.run(engine.review_pr(pr_url))  # type: ignore[arg-type]
+            result = asyncio.run(
+                _run_in_gitlab_scope(engine.review_pr(pr_url))  # type: ignore[arg-type]
+            )
     except MiraError as e:
         raise click.ClickException(str(e)) from e
 
@@ -471,7 +484,9 @@ def serve(
     if not bot_name:
         identity_auth = app_auth or gitlab_auth or forgejo_auth or bitbucket_auth
         if identity_auth is not None:
-            bot_name = asyncio.run(identity_auth.get_bot_identity()) or "miracodeai"
+            bot_name = (
+                asyncio.run(_run_in_gitlab_scope(identity_auth.get_bot_identity())) or "miracodeai"
+            )
             # Bitbucket nicknames may contain characters the server rejects.
             if not all(c.isascii() and (c.isalnum() or c in "_-") for c in bot_name):
                 click.echo(f"Detected bot identity {bot_name!r} is not a valid @mention name")

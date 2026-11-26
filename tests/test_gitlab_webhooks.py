@@ -2,18 +2,167 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from mira.config import FilterConfig, MiraConfig
+from mira.platforms.gitlab import http as gitlab_http
 from mira.platforms.gitlab.auth import GitLabTokenAuth
+from mira.platforms.gitlab.http import (
+    GitLabHttpRuntime,
+    GitLabRequestError,
+    gitlab_http_scope,
+)
 from mira.platforms.server import create_app
 
 GL_SECRET = "gl-secret"
 BOT = "mira-bot"
+
+
+@pytest.fixture
+def fast_gitlab_retries(monkeypatch: pytest.MonkeyPatch):
+    """Skip executor backoff sleeps while keeping retries and sends real."""
+
+    async def _sleep(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(gitlab_http, "_sleep", _sleep)
+
+
+class _ManualClock:
+    """Deterministic monotonic clock; sleeps are released by the test."""
+
+    def __init__(self, start: float = 1_000_000.0) -> None:
+        self.now = start
+
+    def time(self) -> float:
+        return self.now
+
+
+async def _next_sleep(
+    sleep_calls: asyncio.Queue[tuple[float, asyncio.Event]],
+    *,
+    what: str,
+    timeout: float = 2.0,
+) -> tuple[float, asyncio.Event]:
+    """Bounded read of the next injected sleep; a regressed gate fails fast."""
+    try:
+        return await asyncio.wait_for(sleep_calls.get(), timeout=timeout)
+    except TimeoutError as exc:
+        raise AssertionError(what) from exc
+
+
+async def _cancel_and_await(tasks: list[asyncio.Task]) -> None:
+    """Cancel every tracked task and await completion before runtime teardown."""
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _run_discovery_gate_scenario(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    bypass_gate: bool = False,
+    tasks: list[asyncio.Task] | None = None,
+    wait_timeout: float = 2.0,
+) -> tuple[httpx.Response, list[dict[str, object]], list[httpx.AsyncClient]]:
+    """Drive discovery plus a sibling provider through one owned runtime.
+
+    ``bypass_gate`` skips the executor's pre-dispatch gate to emulate the
+    regression where a throttled sibling never waits; the bounded sleep read
+    must then fail instead of hanging. Created tasks are appended to ``tasks``
+    when supplied, and are always cancelled and awaited before close.
+    """
+    from mira.platforms.gitlab import webhook as gw
+    from mira.providers.gitlab import GitLabProvider
+
+    clock = _ManualClock()
+    sleep_calls: asyncio.Queue[tuple[float, asyncio.Event]] = asyncio.Queue()
+
+    async def fake_sleep(seconds: float) -> None:
+        release = asyncio.Event()
+        sleep_calls.put_nowait((seconds, release))
+        await release.wait()
+        clock.now += seconds
+
+    monkeypatch.setattr(gitlab_http, "_monotonic", clock.time)
+    monkeypatch.setattr(gitlab_http, "_sleep", fake_sleep)
+
+    discovery_sends = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal discovery_sends
+        if request.url.path.endswith("/projects"):
+            discovery_sends += 1
+            if discovery_sends == 1:
+                return httpx.Response(429, headers={"retry-after": "5"})
+            return httpx.Response(200, json=[])
+        return httpx.Response(200, json={"username": "bot"})
+
+    clients: list[httpx.AsyncClient] = []
+
+    def factory() -> httpx.AsyncClient:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        clients.append(client)
+        return client
+
+    runtime = GitLabHttpRuntime(client_factory=factory)
+    if bypass_gate:
+
+        async def _skip_gate(state, deadline, attempts) -> None:
+            return None
+
+        monkeypatch.setattr(gitlab_http, "_enter_endpoint", _skip_gate)
+
+    provider = GitLabProvider("tok")
+    tracked = tasks if tasks is not None else []
+    result: httpx.Response | None = None
+    projects: list[dict[str, object]] = []
+    async with gitlab_http_scope(runtime):
+        try:
+            discovery = asyncio.create_task(
+                gw.list_gitlab_projects("tok", "https://gitlab.com/api/v4"),
+                name="discovery-gate",
+            )
+            tracked.append(discovery)
+            # The executor records the cooldown before entering its retry sleep.
+            discovery_delay, release_discovery = await _next_sleep(
+                sleep_calls,
+                what="discovery never waited on its Retry-After",
+                timeout=wait_timeout,
+            )
+            assert discovery_delay == 5.0
+
+            gate_wait = asyncio.create_task(
+                provider._request("GET", f"{provider._api}/user"),
+                name="provider-gate",
+            )
+            tracked.append(gate_wait)
+            # The sibling provider request must wait out the shared cooldown.
+            provider_delay, release_provider = await _next_sleep(
+                sleep_calls,
+                what="provider did not wait on the shared gate",
+                timeout=wait_timeout,
+            )
+            assert provider_delay == 5.0
+
+            release_provider.set()
+            result = await gate_wait
+            release_discovery.set()
+            projects = await discovery
+        finally:
+            await _cancel_and_await(tracked)
+            await runtime.aclose()
+
+    assert result is not None
+    return result, projects, clients
 
 
 @pytest.fixture
@@ -375,51 +524,37 @@ async def test_note_non_review_ignores_author_filter(client):
     h.assert_awaited_once()
 
 
-class _FakeGitLabResponse:
-    def __init__(self, payload):
-        self.status_code = 200
-        self._payload = payload
-        self.text = ""
-        self.headers = {}
+def _gitlab_handler(projects, *, requests=None):
+    """MockTransport handler honouring ``active=true`` like GitLab."""
 
-    def json(self):
-        return self._payload
-
-
-class _FakeGitLabClient:
-    """Minimal httpx.AsyncClient stand-in that honours ``active=true`` like GitLab."""
-
-    instances: list[_FakeGitLabClient] = []
-
-    def __init__(self, projects):
-        self.projects = projects
-        self.urls: list[str] = []
-        type(self).instances.append(self)
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *args):
-        return False
-
-    async def get(self, url, **kwargs):
-        self.urls.append(url)
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if requests is not None:
+            requests.append(request)
+        url = str(request.url)
         if "active=true" in url:
             # active=true = not archived and not marked for deletion.
             visible = [
-                p for p in self.projects if not p.get("archived") and not p.get("pending_deletion")
+                p for p in projects if not p.get("archived") and not p.get("pending_deletion")
             ]
         else:
-            visible = self.projects
-        return _FakeGitLabResponse(visible)
+            visible = projects
+        return httpx.Response(200, json=visible)
+
+    return handler
 
 
-def _patch_gitlab_http(projects):
-    _FakeGitLabClient.instances = []
-    return patch(
-        "mira.platforms.gitlab.webhook.httpx.AsyncClient",
-        lambda *a, **k: _FakeGitLabClient(projects),
+@asynccontextmanager
+async def _patch_gitlab_http(projects, *, requests=None):
+    runtime = GitLabHttpRuntime(
+        client_factory=lambda: httpx.AsyncClient(
+            transport=httpx.MockTransport(_gitlab_handler(projects, requests=requests))
+        )
     )
+    async with gitlab_http_scope(runtime):
+        try:
+            yield runtime
+        finally:
+            await runtime.aclose()
 
 
 @pytest.fixture
@@ -439,12 +574,12 @@ def gitlab_project_list():
 async def test_list_gitlab_projects_filters_inactive_server_side(gitlab_project_list):
     from mira.platforms.gitlab import webhook as gw
 
-    with _patch_gitlab_http(gitlab_project_list):
+    requests: list[httpx.Request] = []
+    async with _patch_gitlab_http(gitlab_project_list, requests=requests):
         projects = await gw.list_gitlab_projects("tok", "https://gitlab.com/api/v4")
 
-    client = _FakeGitLabClient.instances[0]
-    assert "active=true" in client.urls[0]
-    assert "include_pending_delete" not in client.urls[0]
+    assert "active=true" in str(requests[0].url)
+    assert "include_pending_delete" not in str(requests[0].url)
     assert [p["path_with_namespace"] for p in projects] == ["netlife/wfp"]
 
 
@@ -453,14 +588,110 @@ async def test_backfill_skips_archived_and_pending_deletion(gitlab_auth, gitlab_
     from mira.platforms.gitlab import webhook as gw
 
     db = MagicMock()
-    with (
-        _patch_gitlab_http(gitlab_project_list),
-        patch("mira.platforms.index_handlers._get_app_db", return_value=db),
-    ):
-        count = await gw.backfill_gitlab_projects(gitlab_auth)
+    async with _patch_gitlab_http(gitlab_project_list):
+        with patch("mira.platforms.index_handlers._get_app_db", return_value=db):
+            count = await gw.backfill_gitlab_projects(gitlab_auth)
 
     # The sync endpoint reports this count; archived and pending-deletion repos
     # must not be registered or included.
     assert count == 1
     db.register_repo.assert_called_once_with("netlife", "wfp", platform="gitlab")
     db.set_repo_visibility.assert_called_once_with("netlife", "wfp", True, platform="gitlab")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [503, 429])
+async def test_discovery_recovers_from_retryable_status(gitlab_project_list, status):
+    from mira.platforms.gitlab import webhook as gw
+
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(status, headers={"retry-after": "0"})
+        return httpx.Response(200, json=gitlab_project_list)
+
+    runtime = GitLabHttpRuntime(
+        client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    )
+    async with gitlab_http_scope(runtime):
+        try:
+            projects = await gw.list_gitlab_projects("tok", "https://gitlab.com/api/v4")
+        finally:
+            await runtime.aclose()
+
+    assert [p["path_with_namespace"] for p in projects] == [
+        "netlife/wfp",
+        "norel/douglas",
+        "netlife/opencode.netlife.pl-deletion_scheduled-88322484",
+    ]
+    assert len(requests) == 2
+    assert requests[0].url == requests[1].url
+
+
+@pytest.mark.asyncio
+async def test_discovery_exhaustion_raises_not_partial_prefix(fast_gitlab_retries):
+    """A successful page 1 must not be returned when page 2 exhausts."""
+    from mira.platforms.gitlab import webhook as gw
+
+    requests: list[httpx.Request] = []
+    statuses: list[int] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.params.get("page") == "2":
+            statuses.append(503)
+            return httpx.Response(503, headers={"retry-after": "0"})
+        statuses.append(200)
+        next_url = f"{request.url}&page=2"
+        return httpx.Response(
+            200,
+            json=[{"path_with_namespace": "netlife/wfp", "visibility": "private"}],
+            headers={"link": f'<{next_url}>; rel="next"'},
+        )
+
+    runtime = GitLabHttpRuntime(
+        client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    )
+    async with gitlab_http_scope(runtime):
+        try:
+            with pytest.raises(GitLabRequestError) as excinfo:
+                await gw.list_gitlab_projects("tok", "https://gitlab.com/api/v4")
+        finally:
+            await runtime.aclose()
+
+    assert excinfo.value.attempts == 5
+    # Page 1 succeeds, then page 2 is retried five times without a prefix result.
+    assert statuses == [200, 503, 503, 503, 503, 503]
+    assert len(requests) == 6
+    assert all(request.url.params.get("page") == "2" for request in requests[1:])
+    assert len({str(request.url) for request in requests[1:]}) == 1
+
+
+@pytest.mark.asyncio
+async def test_discovery_429_gates_concurrent_provider_request(monkeypatch: pytest.MonkeyPatch):
+    """A discovery throttle is shared with provider calls on the same token.
+
+    A manual monotonic clock plus per-sleep release events make the gate wait
+    deterministic: no real sleeping and no wall-clock assertions.
+    """
+    result, projects, clients = await _run_discovery_gate_scenario(monkeypatch)
+    assert result.json()["username"] == "bot"
+    assert projects == []
+    assert len(clients) == 1
+
+
+@pytest.mark.asyncio
+async def test_missing_shared_gate_fails_fast_without_pending_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Negative control: a sibling that skips the gate must fail the bounded
+    wait promptly and leave no pending tasks after cleanup."""
+    tasks: list[asyncio.Task] = []
+    with pytest.raises(AssertionError, match="provider did not wait"):
+        await _run_discovery_gate_scenario(
+            monkeypatch, bypass_gate=True, tasks=tasks, wait_timeout=1.0
+        )
+    assert tasks
+    assert all(task.done() for task in tasks)

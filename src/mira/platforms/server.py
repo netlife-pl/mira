@@ -28,10 +28,45 @@ from mira.platforms.github.webhook import (
     backfill_missing_indexes,
     dispatch_github_event,
 )
+from mira.platforms.gitlab.background import drain as drain_gitlab_background
+from mira.platforms.gitlab.http import GitLabHttpRuntime, gitlab_http_scope
 
 logger = logging.getLogger(__name__)
 
 _SAFE_BOT_NAME = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+def _log_background_failure(task: asyncio.Task[Any], label: str) -> None:
+    """Log a finished background task without treating cancellation as failure."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning("%s: %s", label, exc)
+
+
+class _BindGitLabHttpRuntime:
+    """Borrow the lifespan-owned runtime for one HTTP request.
+
+    A pure ASGI wrapper (rather than ``BaseHTTPMiddleware``) awaits the
+    downstream app in the same task, so the ContextVar binding reaches route
+    handlers, FastAPI ``BackgroundTasks`` and ``asyncio.create_task`` jobs a
+    request spawns. Lifespan ContextVars do not reach ASGI request tasks on
+    their own, hence this explicit middleware.
+    """
+
+    def __init__(self, asgi_app: Any, app: FastAPI) -> None:
+        self.asgi_app = asgi_app
+        self.app = app
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] == "http":
+            runtime = getattr(self.app.state, "gitlab_http_runtime", None)
+            if runtime is not None:
+                async with gitlab_http_scope(runtime):
+                    await self.asgi_app(scope, receive, send)
+                return
+        await self.asgi_app(scope, receive, send)
 
 
 def _json_status(status: str) -> Response:
@@ -61,6 +96,12 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # One runtime per application process, owned here and borrowed by the
+        # HTTP middleware and lifespan tasks. Clients stay lazy: no connection
+        # is made until the first GitLab request.
+        runtime = GitLabHttpRuntime()
+        app.state.gitlab_http_runtime = runtime
+
         # Backfill is a GitHub-installation concept; skip it on GitLab-only.
         backfill_task = (
             asyncio.create_task(backfill_missing_indexes(app_auth))
@@ -68,24 +109,27 @@ def create_app(
             else None
         )
         if backfill_task is not None:
-            backfill_task.add_done_callback(
-                lambda t: (
-                    logger.warning("Backfill failed: %s", t.exception()) if t.exception() else None
-                )
-            )
+            backfill_task.add_done_callback(lambda t: _log_background_failure(t, "Backfill failed"))
+
+        gl_task: asyncio.Task[Any] | None = None
+        fj_task: asyncio.Task[Any] | None = None
+        bb_task: asyncio.Task[Any] | None = None
 
         # GitLab's equivalent: discover the projects the token can access and
         # register them so they're in the dashboard ready to index up front.
+        # Discovery explicitly borrows the owned runtime for its whole scope.
         if gitlab_auth is not None:
             from mira.platforms.gitlab.webhook import backfill_gitlab_projects
 
-            gl_task = asyncio.create_task(backfill_gitlab_projects(gitlab_auth))
+            async def run_gitlab_discovery(auth: Any) -> None:
+                async with gitlab_http_scope(runtime):
+                    await backfill_gitlab_projects(auth)
+
+            gl_task = asyncio.create_task(
+                run_gitlab_discovery(gitlab_auth), name="gitlab-discovery"
+            )
             gl_task.add_done_callback(
-                lambda t: (
-                    logger.warning("GitLab discovery failed: %s", t.exception())
-                    if t.exception()
-                    else None
-                )
+                lambda t: _log_background_failure(t, "GitLab discovery failed")
             )
 
         # Forgejo's equivalent: discover repos the token can access and
@@ -95,49 +139,47 @@ def create_app(
 
             fj_task = asyncio.create_task(backfill_forgejo_repos(forgejo_auth))
             fj_task.add_done_callback(
-                lambda t: (
-                    logger.warning("Forgejo discovery failed: %s", t.exception())
-                    if t.exception()
-                    else None
-                )
+                lambda t: _log_background_failure(t, "Forgejo discovery failed")
             )
 
         # Bitbucket's equivalent: discover the repos the credential can access.
-        bb_task = None
         if bitbucket_auth is not None:
             from mira.platforms.bitbucket.webhook import backfill_bitbucket_repos
 
             bb_task = asyncio.create_task(backfill_bitbucket_repos(bitbucket_auth))
             bb_task.add_done_callback(
-                lambda t: (
-                    logger.warning("Bitbucket discovery failed: %s", t.exception())
-                    if not t.cancelled() and t.exception()
-                    else None
-                )
+                lambda t: _log_background_failure(t, "Bitbucket discovery failed")
             )
 
         from mira.security.poller import run_forever as run_vuln_poller
 
         vuln_task = asyncio.create_task(run_vuln_poller())
-        vuln_task.add_done_callback(
-            lambda t: (
-                logger.warning("Vuln poller crashed: %s", t.exception())
-                if t.exception() and not t.cancelled()
-                else None
-            )
-        )
+        vuln_task.add_done_callback(lambda t: _log_background_failure(t, "Vuln poller crashed"))
 
-        yield
-        if backfill_task is not None and not backfill_task.done():
-            backfill_task.cancel()
-        if forgejo_auth is not None and not fj_task.done():
-            fj_task.cancel()
-        if bb_task is not None and not bb_task.done():
-            bb_task.cancel()
-        if not vuln_task.done():
-            vuln_task.cancel()
+        try:
+            yield
+        finally:
+            # Cancel every lifespan-owned task, await it (including GitLab
+            # discovery cancellation), then close the pooled clients. Runs on
+            # exceptional exits too so a crash cannot leak tasks or clients.
+            background_tasks = [
+                task
+                for task in (backfill_task, gl_task, fj_task, bb_task, vuln_task)
+                if task is not None
+            ]
+            for task in background_tasks:
+                if not task.done():
+                    task.cancel()
+            if background_tasks:
+                await asyncio.gather(*background_tasks, return_exceptions=True)
+            # Dashboard indexing jobs borrow this same runtime; cancel and await
+            # their terminal cleanup before closing pooled clients. Other apps'
+            # registries are untouched.
+            await drain_gitlab_background(runtime)
+            await runtime.aclose()
 
     app = FastAPI(title="Mira", lifespan=lifespan)
+    app.add_middleware(_BindGitLabHttpRuntime, app=app)
 
     @app.get("/health")
     async def health() -> dict[str, str]:

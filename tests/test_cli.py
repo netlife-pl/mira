@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
+import pytest
 from click.testing import CliRunner
 
 from mira.cli import _format_json, _format_text, main
@@ -17,6 +20,10 @@ from mira.models import (
     WalkthroughFileEntry,
     WalkthroughResult,
 )
+from mira.platforms.gitlab import http as gitlab_http
+from mira.platforms.gitlab.http import _RUNTIME_CONTEXT, request_gitlab
+
+GITLAB_API_URL = "https://gitlab.example.com/api/v4"
 
 
 def _make_result(**overrides) -> ReviewResult:
@@ -364,3 +371,105 @@ class TestCLI:
 
         assert result.exit_code != 0
         assert "requires --config" in result.output
+
+    @staticmethod
+    def _client_recorder(
+        created: list[httpx.AsyncClient],
+        loops: list[asyncio.AbstractEventLoop],
+    ):
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"username": "mira-bot"})
+
+        def factory() -> httpx.AsyncClient:
+            # A client may only be built inside the invocation's event loop.
+            loops.append(asyncio.get_running_loop())
+            client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            created.append(client)
+            return client
+
+        return factory
+
+    def test_review_owns_separate_scoped_runtime_per_invocation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        created: list[httpx.AsyncClient] = []
+        loops: list[asyncio.AbstractEventLoop] = []
+        runtimes: list[object] = []
+
+        async def fake_review_diff(*args, **kwargs):
+            runtimes.append(_RUNTIME_CONTEXT.get())
+            response = await request_gitlab("tok", GITLAB_API_URL, "GET", f"{GITLAB_API_URL}/user")
+            assert response.status_code == 200
+            return _make_result()
+
+        factory = self._client_recorder(created, loops)
+        with (
+            patch("mira.cli.ReviewEngine") as mock_engine_cls,
+            patch("mira.cli.load_config") as mock_load,
+            patch.object(gitlab_http, "_default_client_factory", factory),
+        ):
+            mock_load.return_value = MagicMock()
+            engine = MagicMock()
+            engine.review_diff = AsyncMock(side_effect=fake_review_diff)
+            mock_engine_cls.return_value = engine
+
+            assert created == []  # no client is built before the invocation loop
+            for _ in range(2):
+                result = CliRunner().invoke(main, ["review", "--stdin"], input="diff\n")
+                assert result.exit_code == 0, result.output
+
+        assert len(runtimes) == 2
+        assert all(runtime is not None for runtime in runtimes)
+        assert runtimes[0] is not runtimes[1]
+        assert len(loops) == 2
+        assert loops[0] is not loops[1]
+        assert len(created) == 2
+        assert created[0] is not created[1]
+        assert all(client.is_closed for client in created)
+        assert all(runtime._closed for runtime in runtimes)  # type: ignore[attr-defined]
+
+    def test_serve_identity_bootstrap_owns_scoped_runtime(self, monkeypatch: pytest.MonkeyPatch):
+        created: list[httpx.AsyncClient] = []
+        loops: list[asyncio.AbstractEventLoop] = []
+        runtimes: list[object] = []
+
+        async def fake_identity(self):
+            runtimes.append(_RUNTIME_CONTEXT.get())
+            response = await request_gitlab("tok", GITLAB_API_URL, "GET", f"{GITLAB_API_URL}/user")
+            assert response.status_code == 200
+            return "mira-bot"
+
+        factory = self._client_recorder(created, loops)
+        with (
+            patch(
+                "mira.platforms.gitlab.auth.GitLabTokenAuth.get_bot_identity",
+                fake_identity,
+            ),
+            patch("mira.dashboard.api.register_dashboard", lambda app: None),
+            patch("mira.dashboard.api._app_db.set_setting", MagicMock()),
+            patch("uvicorn.run") as uvicorn_run,
+            patch.object(gitlab_http, "_default_client_factory", factory),
+        ):
+            for _ in range(2):
+                result = CliRunner().invoke(
+                    main,
+                    [
+                        "serve",
+                        "--gitlab-token",
+                        "tok",
+                        "--gitlab-webhook-secret",
+                        "sec",
+                    ],
+                )
+                assert result.exit_code == 0, result.output
+
+        assert uvicorn_run.call_count == 2
+        assert len(runtimes) == 2
+        assert all(runtime is not None for runtime in runtimes)
+        assert runtimes[0] is not runtimes[1]
+        assert len(loops) == 2
+        assert loops[0] is not loops[1]
+        assert len(created) == 2
+        assert created[0] is not created[1]
+        assert all(client.is_closed for client in created)
+        assert all(runtime._closed for runtime in runtimes)  # type: ignore[attr-defined]
