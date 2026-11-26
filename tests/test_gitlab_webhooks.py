@@ -45,6 +45,126 @@ class _ManualClock:
         return self.now
 
 
+async def _next_sleep(
+    sleep_calls: asyncio.Queue[tuple[float, asyncio.Event]],
+    *,
+    what: str,
+    timeout: float = 2.0,
+) -> tuple[float, asyncio.Event]:
+    """Bounded read of the next injected sleep; a regressed gate fails fast."""
+    try:
+        return await asyncio.wait_for(sleep_calls.get(), timeout=timeout)
+    except TimeoutError as exc:
+        raise AssertionError(what) from exc
+
+
+async def _cancel_and_await(tasks: list[asyncio.Task]) -> None:
+    """Cancel every tracked task and await completion before runtime teardown."""
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _run_discovery_gate_scenario(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    bypass_gate: bool = False,
+    tasks: list[asyncio.Task] | None = None,
+    wait_timeout: float = 2.0,
+) -> tuple[httpx.Response, list[dict[str, object]], list[httpx.AsyncClient]]:
+    """Drive discovery plus a sibling provider through one owned runtime.
+
+    ``bypass_gate`` skips the executor's pre-dispatch gate to emulate the
+    regression where a throttled sibling never waits; the bounded sleep read
+    must then fail instead of hanging. Created tasks are appended to ``tasks``
+    when supplied, and are always cancelled and awaited before close.
+    """
+    from mira.platforms.gitlab import webhook as gw
+    from mira.providers.gitlab import GitLabProvider
+
+    clock = _ManualClock()
+    sleep_calls: asyncio.Queue[tuple[float, asyncio.Event]] = asyncio.Queue()
+
+    async def fake_sleep(seconds: float) -> None:
+        release = asyncio.Event()
+        sleep_calls.put_nowait((seconds, release))
+        await release.wait()
+        clock.now += seconds
+
+    monkeypatch.setattr(gitlab_http, "_monotonic", clock.time)
+    monkeypatch.setattr(gitlab_http, "_sleep", fake_sleep)
+
+    discovery_sends = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal discovery_sends
+        if request.url.path.endswith("/projects"):
+            discovery_sends += 1
+            if discovery_sends == 1:
+                return httpx.Response(429, headers={"retry-after": "5"})
+            return httpx.Response(200, json=[])
+        return httpx.Response(200, json={"username": "bot"})
+
+    clients: list[httpx.AsyncClient] = []
+
+    def factory() -> httpx.AsyncClient:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        clients.append(client)
+        return client
+
+    runtime = GitLabHttpRuntime(client_factory=factory)
+    if bypass_gate:
+
+        async def _skip_gate(state, deadline, attempts) -> None:
+            return None
+
+        monkeypatch.setattr(gitlab_http, "_enter_endpoint", _skip_gate)
+
+    provider = GitLabProvider("tok")
+    tracked = tasks if tasks is not None else []
+    result: httpx.Response | None = None
+    projects: list[dict[str, object]] = []
+    async with gitlab_http_scope(runtime):
+        try:
+            discovery = asyncio.create_task(
+                gw.list_gitlab_projects("tok", "https://gitlab.com/api/v4"),
+                name="discovery-gate",
+            )
+            tracked.append(discovery)
+            # The executor records the cooldown before entering its retry sleep.
+            discovery_delay, release_discovery = await _next_sleep(
+                sleep_calls,
+                what="discovery never waited on its Retry-After",
+                timeout=wait_timeout,
+            )
+            assert discovery_delay == 5.0
+
+            gate_wait = asyncio.create_task(
+                provider._request("GET", f"{provider._api}/user"),
+                name="provider-gate",
+            )
+            tracked.append(gate_wait)
+            # The sibling provider request must wait out the shared cooldown.
+            provider_delay, release_provider = await _next_sleep(
+                sleep_calls,
+                what="provider did not wait on the shared gate",
+                timeout=wait_timeout,
+            )
+            assert provider_delay == 5.0
+
+            release_provider.set()
+            result = await gate_wait
+            release_discovery.set()
+            projects = await discovery
+        finally:
+            await _cancel_and_await(tracked)
+            await runtime.aclose()
+
+    assert result is not None
+    return result, projects, clients
+
+
 @pytest.fixture
 def gitlab_auth():  # noqa: ANN201
     auth = GitLabTokenAuth("tok")
@@ -556,62 +676,22 @@ async def test_discovery_429_gates_concurrent_provider_request(monkeypatch: pyte
     A manual monotonic clock plus per-sleep release events make the gate wait
     deterministic: no real sleeping and no wall-clock assertions.
     """
-    from mira.platforms.gitlab import webhook as gw
-    from mira.providers.gitlab import GitLabProvider
-
-    clock = _ManualClock()
-    sleep_calls: asyncio.Queue[tuple[float, asyncio.Event]] = asyncio.Queue()
-
-    async def fake_sleep(seconds: float) -> None:
-        release = asyncio.Event()
-        sleep_calls.put_nowait((seconds, release))
-        await release.wait()
-        clock.now += seconds
-
-    monkeypatch.setattr(gitlab_http, "_monotonic", clock.time)
-    monkeypatch.setattr(gitlab_http, "_sleep", fake_sleep)
-
-    discovery_sends = 0
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal discovery_sends
-        if request.url.path.endswith("/projects"):
-            discovery_sends += 1
-            if discovery_sends == 1:
-                return httpx.Response(429, headers={"retry-after": "5"})
-            return httpx.Response(200, json=[])
-        return httpx.Response(200, json={"username": "bot"})
-
-    clients: list[httpx.AsyncClient] = []
-
-    def factory() -> httpx.AsyncClient:
-        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        clients.append(client)
-        return client
-
-    runtime = GitLabHttpRuntime(client_factory=factory)
-    provider = GitLabProvider("tok")
-    async with gitlab_http_scope(runtime):
-        try:
-            discovery = asyncio.create_task(
-                gw.list_gitlab_projects("tok", "https://gitlab.com/api/v4")
-            )
-            # The executor records the cooldown before entering its retry sleep.
-            discovery_delay, release_discovery = await sleep_calls.get()
-            assert discovery_delay == 5.0
-
-            gate_wait = asyncio.create_task(provider._request("GET", f"{provider._api}/user"))
-            # The sibling provider request must wait out the shared cooldown.
-            provider_delay, release_provider = await sleep_calls.get()
-            assert provider_delay == 5.0
-
-            release_provider.set()
-            result = await gate_wait
-            release_discovery.set()
-            projects = await discovery
-        finally:
-            await runtime.aclose()
-
+    result, projects, clients = await _run_discovery_gate_scenario(monkeypatch)
     assert result.json()["username"] == "bot"
     assert projects == []
     assert len(clients) == 1
+
+
+@pytest.mark.asyncio
+async def test_missing_shared_gate_fails_fast_without_pending_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Negative control: a sibling that skips the gate must fail the bounded
+    wait promptly and leave no pending tasks after cleanup."""
+    tasks: list[asyncio.Task] = []
+    with pytest.raises(AssertionError, match="provider did not wait"):
+        await _run_discovery_gate_scenario(
+            monkeypatch, bypass_gate=True, tasks=tasks, wait_timeout=1.0
+        )
+    assert tasks
+    assert all(task.done() for task in tasks)

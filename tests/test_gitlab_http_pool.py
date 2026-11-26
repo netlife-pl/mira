@@ -62,6 +62,7 @@ class _LoopbackServer(ThreadingHTTPServer):
         self.url = ""
         self.connection_count = 0
         self.connections: list[socket.socket] = []
+        self.threads: list[threading.Thread] = []
         self.gate: threading.Event | None = None
         self.gate_target = 0
         self._lock = threading.Lock()
@@ -72,7 +73,15 @@ class _LoopbackServer(ThreadingHTTPServer):
             self.connections.append(request)
             if self.gate is not None and self.connection_count >= self.gate_target:
                 self.gate.set()
-        super().process_request(request, client_address)
+        # Own the handler thread explicitly so teardown can join it; closing a
+        # socket alone does not reliably interrupt a blocked handler read.
+        thread = threading.Thread(
+            target=self.process_request_thread,
+            args=(request, client_address),
+            daemon=True,
+        )
+        self.threads.append(thread)
+        thread.start()
 
     def handle_error(self, request: socket.socket, client_address: tuple[str, int]) -> None:
         """Teardown closes tracked sockets while handler threads are blocked."""
@@ -87,17 +96,27 @@ async def loopback_server(*, gate_target: int = 0):
     if gate_target:
         server.gate = threading.Event()
         server.gate_target = gate_target
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    serve_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    serve_thread.start()
     try:
         yield server
     finally:
+        # Release gated handlers first, then stop accepting and shut down every
+        # accepted socket so blocked reads/writes wake; closing alone does not.
+        if server.gate is not None:
+            server.gate.set()
         server.shutdown()
         server.server_close()
         for sock in server.connections:
             with suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+        for sock in server.connections:
+            with suppress(OSError):
                 sock.close()
-        thread.join(timeout=5)
+        for handler_thread in server.threads:
+            handler_thread.join(timeout=5)
+        assert all(not handler_thread.is_alive() for handler_thread in server.threads)
+        serve_thread.join(timeout=5)
 
 
 def _loopback_client(base_url: str) -> httpx.AsyncClient:
