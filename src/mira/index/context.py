@@ -48,8 +48,9 @@ class ProviderSourceFetcher:
             self._cache[path] = content if content else None
             return self._cache[path]
         except GitLabRequestError as exc:
-            # Transient/exhausted: warn and skip this path without caching it
-            # as absent, so a later fetch in the same review can still retry.
+            # Typed failure (exhausted retries, deadline or rejected status):
+            # warn and skip this path without caching it as absent, so a later
+            # fetch in the same review can still retry.
             logger.warning(
                 "Source fetch for %s failed after retries; not treating it as missing: %s",
                 path,

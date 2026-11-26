@@ -143,9 +143,9 @@ async def resolve_verified_threads(
                 pr_info, t.path, pr_info.head_branch
             )
         except GitLabRequestError as exc:
-            # An exhausted fetch says nothing about the file's content. Leave
-            # its threads out of LLM verification and unresolved below instead
-            # of submitting a fabricated empty source.
+            # An exhausted or rejected source fetch says nothing about the
+            # file's content. Leave its threads out of LLM verification and
+            # unresolved below instead of submitting a fabricated empty source.
             unavailable_paths.add(t.path)
             logger.warning(
                 "Exhausted source fetch for %s; leaving its thread(s) unresolved: %s",

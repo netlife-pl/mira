@@ -301,6 +301,69 @@ class TestPostReview:
         notes = [c for c in calls if c[1].endswith("/notes")]
         assert any("a.py:10" in (c[2] or {}).get("body", "") for c in notes)
 
+    @staticmethod
+    def _one_comment_result() -> ReviewResult:
+        return ReviewResult(
+            comments=[
+                ReviewComment(
+                    path="a.py",
+                    line=10,
+                    end_line=None,
+                    severity=Severity.WARNING,
+                    category="bug",
+                    title="x",
+                    body="y",
+                    confidence=0.9,
+                )
+            ],
+            summary="",
+            key_issues=[],
+        )
+
+    @pytest.mark.asyncio
+    async def test_lost_discussion_response_does_not_post_fallback_note(self):
+        """An ambiguous POST failure must not trigger a second write.
+
+        The discussion may already have been committed server-side; the plain
+        note fallback would duplicate the finding.
+        """
+        calls = []
+
+        def handler(method, url, **kw):
+            calls.append((method, url, kw.get("data")))
+            if url.endswith("/changes"):
+                return _FakeResp(json_data={"diff_refs": {}, "changes": []})
+            if url.endswith("/discussions"):
+                raise httpx.ReadTimeout("response lost after commit")
+            return _FakeResp(status=201, json_data={"id": 1})  # /notes
+
+        async with _patch(handler):
+            with pytest.raises(GitLabRequestError):
+                await GitLabProvider("tok").post_review(_PR, self._one_comment_result())
+
+        assert [c for c in calls if c[1].endswith("/notes")] == []
+        assert len([c for c in calls if c[1].endswith("/discussions")]) == 1
+
+    @pytest.mark.asyncio
+    async def test_server_error_does_not_post_fallback_note(self):
+        """Only a positively identified invalid-position 400 falls back."""
+        calls = []
+
+        def handler(method, url, **kw):
+            calls.append((method, url, kw.get("data")))
+            if url.endswith("/changes"):
+                return _FakeResp(json_data={"diff_refs": {}, "changes": []})
+            if url.endswith("/discussions"):
+                return _FakeResp(status=500, text="upstream exploded")
+            return _FakeResp(status=201, json_data={"id": 1})  # /notes
+
+        async with _patch(handler):
+            with pytest.raises(GitLabRequestError) as excinfo:
+                await GitLabProvider("tok").post_review(_PR, self._one_comment_result())
+
+        assert excinfo.value.status_code == 500
+        assert [c for c in calls if c[1].endswith("/notes")] == []
+
 
 class TestCompareDiff:
     @pytest.mark.asyncio
@@ -422,6 +485,20 @@ class TestGetFileContent:
 
         async with _patch(handler):
             assert await GitLabProvider("tok").get_file_content(_PR, "gone.py", "feat") == ""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [401, 403])
+    async def test_terminal_auth_rejection_is_typed_not_empty(self, status):
+        """A rejected source fetch must not become fabricated empty content."""
+
+        def handler(method, url, **kw):
+            return _FakeResp(status=status, text="denied")
+
+        async with _patch(handler):
+            with pytest.raises(GitLabRequestError) as excinfo:
+                await GitLabProvider("tok").get_file_content(_PR, "a.py", "feat")
+
+        assert excinfo.value.status_code == status
 
 
 class TestGetRepoTree:

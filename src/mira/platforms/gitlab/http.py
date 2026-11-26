@@ -125,7 +125,12 @@ def retryable_exception(method: str, exc: httpx.TransportError) -> bool:
 
 
 class GitLabRequestError(ProviderError):
-    """A GitLab request exhausted its retries, deadline or terminal transport."""
+    """A GitLab request failed or was rejected.
+
+    Raised when retries/deadline are exhausted, a transport failure is terminal,
+    or a response carries a status the caller does not accept. ``status_code``
+    is the concrete HTTP status when one was received.
+    """
 
     def __init__(self, reason: str, attempts: int, status_code: int | None = None) -> None:
         self.reason = reason

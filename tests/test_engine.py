@@ -1870,6 +1870,31 @@ class TestThreadVerificationUnavailablePaths:
         assert decisions[0].thread_id == "T1" and decisions[0].fixed is False
 
     @pytest.mark.asyncio
+    async def test_terminal_source_rejection_is_not_verified_as_empty(self, pr_info):
+        """A terminal 401/403 rejection leaves the thread unresolved.
+
+        It must never become an empty source submitted to the LLM: an empty
+        file can look "fixed" and get the thread resolved.
+        """
+        threads = [UnresolvedThread(thread_id="T1", path="src/app.py", line=10, body="secret")]
+        provider = AsyncMock()
+        provider.get_unresolved_bot_threads = AsyncMock(return_value=threads)
+        provider.get_file_content = AsyncMock(
+            side_effect=GitLabRequestError("GitLab GET src/app.py → 401", 1, 401)
+        )
+        provider.resolve_threads = AsyncMock(return_value=0)
+        llm = self._llm()
+
+        checked, resolved, remaining, decisions = await resolve_verified_threads(
+            provider, llm, pr_info, "mira", dry_run=False
+        )
+
+        llm.complete.assert_not_called()
+        assert (checked, resolved) == (0, 0)
+        assert [t.thread_id for t in remaining] == ["T1"]
+        provider.resolve_threads.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_missing_file_404_is_still_submitted_and_counted(self, pr_info):
         threads = [
             UnresolvedThread(thread_id="T1", path="src/app.py", line=10, body="secret"),

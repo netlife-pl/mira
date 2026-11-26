@@ -37,6 +37,10 @@ _MR_URL_PATTERN = re.compile(
     r"(?:https?://[^/]+/)?(?P<owner>.+?)/(?P<repo>[^/]+?)(?:/-/merge_requests/|!)(?P<number>\d+)"
 )
 
+# GitLab rejects an inline discussion whose position is not on a changed line
+# with HTTP 400. Only that structured status warrants the plain-note fallback.
+_INVALID_POSITION_STATUS = 400
+
 
 def parse_mr_url(mr_url: str) -> tuple[str, str, int]:
     """Parse an MR URL or shorthand into (owner, repo, iid).
@@ -116,9 +120,15 @@ class GitLabProvider(BaseProvider):
     ) -> httpx.Response:
         resp = await request_gitlab(self._token, self._api, method, url, **kw)
         if resp.status_code not in ok:
+            # Typed status (not a parsed message) so callers can distinguish
+            # an invalid-position rejection from an ambiguous transport loss.
             # Diagnostics carry method/origin/path/status only: never the query
             # string, request body or response body.
-            raise ProviderError(f"GitLab {method} {_safe_target(url)} → {resp.status_code}")
+            raise GitLabRequestError(
+                f"GitLab {method} {_safe_target(url)}",
+                attempts=1,
+                status_code=resp.status_code,
+            )
         return resp
 
     async def _paginate(self, url: str) -> list[dict[str, Any]]:
@@ -249,21 +259,18 @@ class GitLabProvider(BaseProvider):
             raise ProviderError(f"Failed to fetch compare diff: {e}") from e
 
     async def get_file_content(self, pr_info: PRInfo, path: str, ref: str) -> str:
-        """Raw file content at a ref — used to verify a thread's fix landed."""
+        """Raw file content at a ref — used to verify a thread's fix landed.
+
+        Only an accepted 404 and genuinely empty content are empty. Every
+        other failure propagates as a typed error so callers cannot mistake it
+        for absence (optional context warns; thread verification leaves the
+        path unresolved).
+        """
         url = (
             f"{self._project(pr_info)}/repository/files/"
             f"{quote(path, safe='')}/raw?ref={quote(ref, safe='')}"
         )
-        try:
-            resp = await self._request("GET", url, ok=(200, 404))
-        except GitLabRequestError:
-            # Exhausted retries/deadline are not evidence the file is absent;
-            # let the caller decide (optional context warns, thread
-            # verification leaves the path unresolved).
-            raise
-        except ProviderError as exc:
-            logger.warning("Failed to fetch %s@%s: %s", path, ref, exc)
-            return ""
+        resp = await self._request("GET", url, ok=(200, 404))
         return resp.text if resp.status_code == 200 else ""
 
     async def get_repo_tree(self, pr_info: PRInfo, ref: str) -> list[str]:
@@ -372,9 +379,13 @@ class GitLabProvider(BaseProvider):
                     data={"body": body, **position},
                 )
                 posted += 1
-            except ProviderError as exc:
-                # GitLab 400s when a position lands on an unchanged/context line.
-                # Fall back to a plain note so the finding still surfaces.
+            except GitLabRequestError as exc:
+                # Only a positively identified invalid-position rejection
+                # falls back. An ambiguous failure (e.g. ReadTimeout after the
+                # discussion may have committed) must propagate rather than
+                # create a second write; diagnostics stay status-only.
+                if exc.status_code != _INVALID_POSITION_STATUS:
+                    raise
                 logger.warning(
                     "Inline note failed for %s:%s (%s); posting as a note", comment.path, line, exc
                 )
