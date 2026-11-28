@@ -13,6 +13,7 @@ from mira.http import (
     HttpRetryPolicy,
     HttpService,
     RetryAfterWait,
+    http_service_scope,
     parse_retry_after,
 )
 
@@ -150,6 +151,20 @@ async def test_service_does_not_replay_write_after_transport_failure() -> None:
     assert attempts == 1
 
 
+async def test_service_records_final_attempt_cooldown_for_sibling_requests() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"retry-after": "0.05"})
+
+    service = HttpService(
+        client_factory=lambda **kwargs: httpx.AsyncClient(transport=_transport(handler), **kwargs)
+    )
+    policy = HttpRetryPolicy(max_attempts=1, deadline_seconds=1)
+    with pytest.raises(HttpRequestError):
+        await service.request("https://api.example.test/v1/read", policy=policy, credential="token")
+    key = service._cooldown_key("https://api.example.test", "token")
+    assert service._cooldowns[key].not_before > asyncio.get_running_loop().time()
+
+
 async def test_service_replays_write_after_explicit_429() -> None:
     attempts = 0
 
@@ -244,6 +259,71 @@ async def test_service_close_is_idempotent() -> None:
     service = HttpService()
     await service.aclose()
     await service.aclose()
+
+
+async def test_service_applies_transport_retries_with_retry_after_wait() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ReadTimeout("read timed out", request=request)
+        return httpx.Response(200)
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    service = HttpService(
+        client_factory=lambda **kwargs: httpx.AsyncClient(transport=_transport(handler), **kwargs)
+    )
+    policy = HttpRetryPolicy(max_attempts=2, deadline_seconds=5, sleep=fake_sleep)
+    response = await service.request("https://api.example.test/v1/read", policy=policy)
+    assert response.status_code == 200
+    assert len(sleeps) == 1
+
+
+async def test_service_uses_per_request_timeout_override() -> None:
+    seen: list[float | None] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions.get("timeout"))
+        return httpx.Response(200)
+
+    service = HttpService(
+        client_factory=lambda **kwargs: httpx.AsyncClient(transport=_transport(handler), **kwargs)
+    )
+    policy = HttpRetryPolicy(max_attempts=1, deadline_seconds=5)
+    await service.request("https://api.example.test/v1/read", policy=policy, timeout=1.5)
+    assert seen[0]["read"] == 1.5
+
+
+async def test_service_scope_binds_borrowed_runtime_without_closing_it() -> None:
+    service = HttpService()
+    seen: list[HttpService | None] = []
+
+    async def use() -> None:
+        async with http_service_scope(service) as bound:
+            seen.append(bound)
+
+    await use()
+    assert seen == [service]
+    assert not service._closed
+    await service.aclose()
+
+
+async def test_service_scope_owns_temporary_runtime_when_unbound() -> None:
+    seen: list[HttpService | None] = []
+
+    async def use() -> None:
+        async with http_service_scope() as owned:
+            seen.append(owned)
+
+    await use()
+    assert len(seen) == 1
+    assert seen[0] is not None and seen[0]._closed
 
 
 async def test_service_reuses_real_http_connections() -> None:

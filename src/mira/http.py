@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -147,7 +149,6 @@ class HttpService:
         self._client_factory = client_factory or self._default_client_factory
         self._sleep = sleep
         self._clients: dict[str, httpx.AsyncClient] = {}
-        self._locks: dict[str, asyncio.Lock] = {}
         self._cooldowns: dict[str, _EndpointCooldown] = {}
         self._closed = False
 
@@ -209,11 +210,14 @@ class HttpService:
         params: dict[str, Any] | None = None,
         policy: HttpRetryPolicy,
         client_kwargs: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> httpx.Response:
         if self._closed:
             raise RuntimeError("HTTP service is closed")
         if policy.max_attempts < 1 or policy.deadline_seconds <= 0:
             raise HttpRequestError("retry policy allows no attempts", 0)
+        if timeout is not None and timeout <= 0:
+            raise HttpRequestError("timeout must be positive", 0)
 
         loop = asyncio.get_running_loop()
         started = loop.time()
@@ -221,8 +225,6 @@ class HttpService:
         split = urlsplit(url)
         origin = f"{split.scheme}://{split.netloc}"
         cooldown_key = self._cooldown_key(origin, credential)
-        if cooldown_key not in self._locks:
-            self._locks[cooldown_key] = asyncio.Lock()
         request_headers = dict(headers or {})
 
         async def send_once() -> httpx.Response:
@@ -239,6 +241,8 @@ class HttpService:
                 kwargs["json"] = json
             if params is not None:
                 kwargs["params"] = params
+            if timeout is not None:
+                kwargs["timeout"] = timeout
             return await client.request(method, url, **kwargs)
 
         def should_retry(result: httpx.Response) -> bool:
@@ -365,3 +369,27 @@ class HttpService:
                 url=url,
             ) from exc
         return outcome.result()
+
+
+_HTTP_SERVICE: ContextVar[HttpService | None] = ContextVar("mira_http_service", default=None)
+
+
+@asynccontextmanager
+async def http_service_scope(
+    service: HttpService | None = None,
+) -> AsyncIterator[HttpService]:
+    """Bind a borrowed service, or own and close a temporary one."""
+    owned = service is None
+    runtime = service or HttpService()
+    token = _HTTP_SERVICE.set(runtime)
+    try:
+        yield runtime
+    finally:
+        _HTTP_SERVICE.reset(token)
+        if owned:
+            await runtime.aclose()
+
+
+def current_http_service() -> HttpService | None:
+    """Return the service bound to the current asynchronous context."""
+    return _HTTP_SERVICE.get()
