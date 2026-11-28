@@ -220,6 +220,7 @@ async def test_repo_tarball_failure_still_returns_none(monkeypatch, fetcher, out
         requests.clear()
         result = await fetcher.repo_tarball("example", "app", "feature#frag")
         assert result is None
+        assert requests  # the failure handler was actually exercised
         return
     client_type = httpx.AsyncClient
     monkeypatch.setattr(
@@ -261,42 +262,20 @@ def _resp(json_data=None, *, text="", headers=None, status=200):
     return r
 
 
-class _ServiceResponder(HttpService):
-    def __init__(self, responses):
-        super().__init__()
-        self.responses = iter(responses)
-
-    async def request(self, url, *, method="GET", **kwargs):
-        return next(self.responses)
-
-
-def _patch_service(responses):
-    return patch("mira.platforms.fetch.current_http_service", lambda: _ServiceResponder(responses))
-
-
 class _Recorder(HttpService):
     def __init__(self, side_effect):
         super().__init__()
         self._side_effect = side_effect if callable(side_effect) else iter(side_effect)
         self.requests: list[httpx.Request] = []
-        self._client = None
 
     async def request(self, url, *, method="GET", **kwargs):
-        request = httpx.Request(method, url)
-        self.requests.append(request)
-        if kwargs.get("follow_redirects") or kwargs.get("client_kwargs", {}).get(
-            "follow_redirects"
-        ):
-            if self._client is None:
-                self._client = httpx.AsyncClient(follow_redirects=True)
-            return await self._client.request(method, url)
+        self.requests.append(httpx.Request(method, url))
         if callable(self._side_effect):
             result = self._side_effect(method, url, **kwargs)
             if hasattr(result, "__await__"):
                 return await result
             return result
-        result = next(self._side_effect)
-        return result
+        return next(self._side_effect)
 
 
 def _gitlab_fetcher_with_transport(serve, follow_redirects=False):

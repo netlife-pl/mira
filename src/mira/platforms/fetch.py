@@ -20,6 +20,7 @@ import httpx
 
 from mira.http import HttpRetryPolicy, HttpService, current_http_service
 from mira.platforms import profiles
+from mira.platforms.links import parse_next_link
 
 logger = logging.getLogger(__name__)
 
@@ -314,7 +315,6 @@ class GitLabRepoFetcher:
                     read_timeout=read_timeout,
                     follow_redirects=follow_redirects,
                 )
-        client_kwargs = {"follow_redirects": True} if follow_redirects else {}
         return await service.request(
             url,
             method=method,
@@ -322,7 +322,7 @@ class GitLabRepoFetcher:
             headers={"PRIVATE-TOKEN": self._token},
             params=params,
             timeout=read_timeout,
-            client_kwargs=client_kwargs,
+            follow_redirects=follow_redirects or None,
             policy=HttpRetryPolicy(deadline_seconds=max(read_timeout * 5, 60)),
         )
 
@@ -777,18 +777,10 @@ class BitbucketRepoFetcher:
 
 def _next_link(link_header: str) -> str | None:
     """Extract the rel="next" URL from a Link header (GitLab keyset pagination)."""
-    if not link_header:
-        return None
-    next_url = None
-    for part in link_header.split(","):
-        match = re.fullmatch(r'\s*<([^<>]+)>\s*;\s*rel=(?:"([^"]+)"|([^;\s]+))\s*', part)
-        if not match:
-            raise IncompleteTreeError("Invalid repository tree pagination link")
-        if "next" in (match[2] or match[3]).split():
-            if next_url is not None:
-                raise IncompleteTreeError("Multiple repository tree next links")
-            next_url = match[1]
-    return next_url
+    try:
+        return parse_next_link(link_header)
+    except ValueError as exc:
+        raise IncompleteTreeError(str(exc)) from exc
 
 
 def make_fetcher(platform: str, token: str) -> RepoFetcher:

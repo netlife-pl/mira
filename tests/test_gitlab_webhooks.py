@@ -492,3 +492,61 @@ async def test_gitlab_token_identity_error_is_none():
 
     auth = GitLabTokenAuth("tok", http_service=_Failing())
     assert await auth.get_bot_identity() is None
+
+
+@pytest.mark.asyncio
+async def test_list_gitlab_projects_stops_on_cross_origin_next_link():
+    from mira.platforms.gitlab import webhook as gw
+
+    class _Linked(HttpService):
+        def __init__(self):
+            super().__init__()
+            self.urls: list[str] = []
+
+        async def request(self, url, *, method="GET", **kwargs):
+            self.urls.append(url)
+            return httpx.Response(
+                200,
+                json=[{"path_with_namespace": "netlife/wfp", "visibility": "private"}],
+                headers={"link": '<https://evil.example/projects?page=2>; rel="next"'},
+                request=httpx.Request(method, url),
+            )
+
+    service = _Linked()
+    with patch("mira.platforms.gitlab.webhook.current_http_service", lambda: service):
+        projects = await gw.list_gitlab_projects("tok", "https://gitlab.com/api/v4")
+
+    assert [p["path_with_namespace"] for p in projects] == ["netlife/wfp"]
+    assert len(service.urls) == 1
+
+
+@pytest.mark.asyncio
+async def test_request_binds_lifespan_http_service(gitlab_auth):
+    seen: list[object] = []
+    service = _FakeGitLabService([], username=BOT)
+
+    app = create_app(
+        app_auth=None,
+        webhook_secret=None,
+        bot_name=BOT,
+        gitlab_auth=gitlab_auth,
+        gitlab_webhook_secret=GL_SECRET,
+    )
+    # Simulate the lifespan binding for an ASGI transport that skips lifespan.
+    app.state.http_service = service
+
+    async def capture(*args, **kwargs):
+        from mira.http import current_http_service
+
+        seen.append(current_http_service())
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        with patch("mira.platforms.gitlab.webhook.handle_merge_request", new=capture):
+            resp = await client.post(
+                "/gitlab/webhook",
+                content=json.dumps(_mr_payload(action="open")),
+                headers={"X-Gitlab-Token": GL_SECRET, "X-Gitlab-Event": "Merge Request Hook"},
+            )
+    assert resp.status_code == 200
+    assert seen == [service]

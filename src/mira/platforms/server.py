@@ -148,6 +148,17 @@ def create_app(
 
     app = FastAPI(title="Mira", lifespan=lifespan)
 
+    @app.middleware("http")
+    async def _bind_shared_http_service(request: Request, call_next):
+        # Request tasks do not inherit the lifespan context, so bind the
+        # process service here. Background tasks are spawned downstream while
+        # this scope is active and therefore share it too.
+        service = getattr(request.app.state, "http_service", None)
+        if service is None:
+            return await call_next(request)
+        async with http_service_scope(service):
+            return await call_next(request)
+
     @app.get("/health")
     async def health() -> dict[str, str]:
         db_url = os.environ.get("DATABASE_URL", "")

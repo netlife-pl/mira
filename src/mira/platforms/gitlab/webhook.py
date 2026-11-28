@@ -24,7 +24,8 @@ from mira.platforms import profiles
 from mira.platforms.auth import PlatformAuth
 from mira.platforms.base_branch_policy import base_branch_is_filtered_for_repo
 from mira.platforms.command_policy import is_command_allowed
-from mira.platforms.fetch import _next_link, make_fetcher
+from mira.platforms.fetch import make_fetcher
+from mira.platforms.links import same_origin_next_link
 from mira.platforms.mentions import (
     author_is_filtered,
     has_mention,
@@ -72,7 +73,11 @@ async def list_gitlab_projects(
             logger.warning("GitLab project list failed: %d %s", resp.status_code, resp.text[:200])
             break
         out.extend(resp.json())
-        url = _next_link(resp.headers.get("link", ""))
+        try:
+            url = same_origin_next_link(url, resp.headers.get("link", ""))
+        except ValueError as exc:
+            logger.warning("GitLab project pagination stopped: %s", exc)
+            break
     return out
 
 

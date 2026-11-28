@@ -498,3 +498,22 @@ class TestGetRepoPermission:
 class TestRegistry:
     def test_create_provider_gitlab(self):
         assert isinstance(create_provider("gitlab", "tok"), GitLabProvider)
+
+
+@pytest.mark.asyncio
+async def test_pagination_refuses_cross_origin_next_link():
+    calls: list[str] = []
+
+    def handler(method, url, **kw):
+        calls.append(url)
+        return _FakeResp(
+            json_data=[{"type": "blob", "path": "a.py"}],
+            headers={"link": '<https://evil.example/repository/tree?page=2>; rel="next"'},
+        )
+
+    provider = GitLabProvider("tok")
+    with _patch(handler):
+        tree = await provider.get_repo_tree(_PR, "main")
+
+    assert tree == ["a.py"]
+    assert len(calls) == 1

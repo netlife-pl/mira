@@ -372,3 +372,83 @@ async def test_request_error_is_provider_safe() -> None:
     error = HttpRequestError("terminal transport failure", 2)
     assert isinstance(error, MiraError)
     assert error.safe_message.startswith("terminal transport failure (after 2 attempts)")
+
+
+async def test_far_future_retry_after_is_clamped_to_request_budget() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, headers={"retry-after": "1000000"})
+
+    service = HttpService(
+        client_factory=lambda **kwargs: httpx.AsyncClient(transport=_transport(handler), **kwargs)
+    )
+    policy = HttpRetryPolicy(max_attempts=1, deadline_seconds=0.5, sleep=asyncio.sleep)
+    with pytest.raises(HttpRequestError):
+        await service.request("https://api.example.test/v1/read", policy=policy, credential="token")
+    key = service._cooldown_key("https://api.example.test", "token")
+    remaining = service._cooldowns[key].not_before - asyncio.get_running_loop().time()
+    assert remaining <= 0.5
+
+
+async def test_client_configuration_does_not_leak_between_requests() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/redirect":
+            return httpx.Response(302, headers={"location": "/target"})
+        return httpx.Response(200)
+
+    service = HttpService(
+        client_factory=lambda **kwargs: httpx.AsyncClient(transport=_transport(handler), **kwargs)
+    )
+    policy = HttpRetryPolicy(max_attempts=1, deadline_seconds=5)
+    followed = await service.request(
+        "https://api.example.test/redirect", policy=policy, follow_redirects=True
+    )
+    assert followed.status_code == 200
+    # A default request must still use the non-redirecting client.
+    plain = await service.request("https://api.example.test/redirect", policy=policy)
+    assert plain.status_code == 302
+
+    configured = await service.request(
+        "https://api.example.test/redirect",
+        policy=policy,
+        client_kwargs={"follow_redirects": True},
+    )
+    assert configured.status_code == 200
+    after = await service.request("https://api.example.test/redirect", policy=policy)
+    assert after.status_code == 302
+
+
+class _FlakyDrainResponse:
+    def __init__(self, *, fail_drain: bool) -> None:
+        self.status_code = 200
+        self.headers: dict[str, str] = {}
+        self.fail_drain = fail_drain
+        self.closed = False
+
+    async def aread(self) -> None:
+        if self.fail_drain:
+            raise httpx.ReadTimeout("body read timed out")
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _FlakyDrainClient:
+    def __init__(self) -> None:
+        self.requests = 0
+        self.responses: list[_FlakyDrainResponse] = []
+
+    async def request(self, method: str, url: str, **kwargs) -> _FlakyDrainResponse:
+        self.requests += 1
+        response = _FlakyDrainResponse(fail_drain=self.requests == 1)
+        self.responses.append(response)
+        return response
+
+
+async def test_response_drain_failure_is_retried_for_reads() -> None:
+    client = _FlakyDrainClient()
+    service = HttpService(client_factory=lambda **kwargs: client)
+    policy = HttpRetryPolicy(max_attempts=2, deadline_seconds=5, backoff_cap_seconds=0.01)
+    response = await service.request("https://api.example.test/v1/read", policy=policy)
+    assert response.status_code == 200
+    assert client.requests == 2
+    assert client.responses[0].closed

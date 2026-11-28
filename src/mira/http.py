@@ -148,7 +148,7 @@ class HttpService:
     ) -> None:
         self._client_factory = client_factory or self._default_client_factory
         self._sleep = sleep
-        self._clients: dict[str, httpx.AsyncClient] = {}
+        self._clients: dict[Any, httpx.AsyncClient] = {}
         self._cooldowns: dict[str, _EndpointCooldown] = {}
         self._closed = False
 
@@ -211,6 +211,7 @@ class HttpService:
         params: dict[str, Any] | None = None,
         policy: HttpRetryPolicy,
         client_kwargs: dict[str, Any] | None = None,
+        follow_redirects: bool | None = None,
         timeout: float | None = None,
     ) -> httpx.Response:
         if self._closed:
@@ -230,11 +231,13 @@ class HttpService:
 
         async def send_once() -> httpx.Response:
             await self._wait_for_cooldown(cooldown_key, deadline)
-            key = _cooldown_key(origin, credential)
-            client = self._clients.get(key)
+            # Client construction options are part of the cache key so a
+            # redirect-following client can never serve an ordinary request.
+            client_key = (cooldown_key, tuple(sorted((client_kwargs or {}).items())))
+            client = self._clients.get(client_key)
             if client is None:
                 client = self._client_factory(**(client_kwargs or {}))
-                self._clients[key] = client
+                self._clients[client_key] = client
             kwargs: dict[str, Any] = {"headers": request_headers}
             if content is not None:
                 kwargs["content"] = content
@@ -244,6 +247,8 @@ class HttpService:
                 kwargs["json"] = json
             if params is not None:
                 kwargs["params"] = params
+            if follow_redirects is not None:
+                kwargs["follow_redirects"] = follow_redirects
             if timeout is not None:
                 kwargs["timeout"] = timeout
             return await client.request(method, url, **kwargs)
@@ -254,13 +259,11 @@ class HttpService:
             delay = parse_retry_after(result.headers.get("retry-after"), now=datetime.now(UTC))
             if delay is None:
                 delay = policy.delay_for(retry_state.attempt_number)
+            # A far-future Retry-After is honored only up to this request's
+            # budget; publishing it unbounded would wedge every sibling job.
+            delay = min(delay, max(0.0, deadline - loop.time()))
             self._record_cooldown(cooldown_key, delay)
             return True
-
-        async def close_before_retry(result: httpx.Response) -> httpx.Response:
-            await result.aread()
-            await result.aclose()
-            return result
 
         retrying = AsyncRetrying(
             stop=stop_after_attempt(policy.max_attempts),
@@ -304,6 +307,11 @@ class HttpService:
                 try:
                     async with asyncio.timeout(remaining):
                         response = await send_once()
+                    try:
+                        async with asyncio.timeout(max(0.0, deadline - loop.time())):
+                            await response.aread()
+                    finally:
+                        await response.aclose()
                 except TimeoutError:
                     raise HttpRequestError("overall deadline exceeded", attempts, url=url) from None
                 except httpx.TransportError as exc:
@@ -322,14 +330,12 @@ class HttpService:
                     and response.status_code != 429
                     and response.status_code in _SAFE_RETRY_STATUS
                 ):
-                    await close_before_retry(response)
                     raise HttpRequestError(
                         f"terminal transport failure: HTTP {response.status_code}",
                         attempts,
                         status_code=response.status_code,
                         url=url,
                     )
-                response = await close_before_retry(response)
                 retry_state.set_result(response)
             elif isinstance(action, DoSleep):
                 delay = float(action)

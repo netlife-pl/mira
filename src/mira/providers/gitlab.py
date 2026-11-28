@@ -32,6 +32,7 @@ from mira.models import (
     UnresolvedThread,
 )
 from mira.platforms import profiles
+from mira.platforms.links import same_origin_next_link
 from mira.providers.base import BaseProvider
 from mira.providers.formatting import format_comment_body, format_key_issues
 
@@ -139,7 +140,11 @@ class GitLabProvider(BaseProvider):
         while next_url:
             resp = await self._request("GET", next_url)
             out.extend(resp.json())
-            next_url = _next_link(resp.headers.get("link", ""))
+            try:
+                next_url = same_origin_next_link(self._api, resp.headers.get("link", ""))
+            except ValueError as exc:
+                logger.warning("GitLab pagination stopped: %s", exc)
+                break
         return out
 
     async def _self_username(self) -> str:
@@ -561,13 +566,3 @@ class GitLabProvider(BaseProvider):
 
     async def remove_label(self, pr_info: PRInfo, label: str) -> None:
         await self._request("PUT", self._mr(pr_info), data={"remove_labels": label})
-
-
-def _next_link(link_header: str) -> str | None:
-    """Extract the rel="next" URL from a Link header."""
-    if not link_header:
-        return None
-    for part in link_header.split(","):
-        if 'rel="next"' in part:
-            return part.split(";")[0].strip().strip("<>")
-    return None
