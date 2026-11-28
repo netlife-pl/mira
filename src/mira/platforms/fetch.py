@@ -13,12 +13,14 @@ import io
 import logging
 import re
 import tarfile
-from typing import Protocol
+from typing import Any, Protocol
 from urllib.parse import quote
 
 import httpx
 
+from mira.http import HttpRetryPolicy, HttpService, current_http_service
 from mira.platforms import profiles
+from mira.platforms.links import parse_next_link
 
 logger = logging.getLogger(__name__)
 
@@ -282,9 +284,47 @@ class GitLabRepoFetcher:
     GitHub's single recursive call.
     """
 
-    def __init__(self, token: str, base_url: str = "https://gitlab.com/api/v4") -> None:
+    def __init__(
+        self,
+        token: str,
+        base_url: str = "https://gitlab.com/api/v4",
+        http_service: HttpService | None = None,
+    ) -> None:
         self._token = token
         self._api = base_url.rstrip("/")
+        self._http_service = http_service
+
+    async def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: dict[str, Any] | None = None,
+        read_timeout: float = 30.0,
+        follow_redirects: bool = False,
+    ) -> httpx.Response:
+        service = self._http_service or current_http_service()
+        if service is None:
+            from mira.http import http_service_scope
+
+            async with http_service_scope():
+                return await self._request(
+                    method,
+                    url,
+                    params=params,
+                    read_timeout=read_timeout,
+                    follow_redirects=follow_redirects,
+                )
+        return await service.request(
+            url,
+            method=method,
+            credential=self._token,
+            headers={"PRIVATE-TOKEN": self._token},
+            params=params,
+            timeout=read_timeout,
+            follow_redirects=follow_redirects or None,
+            policy=HttpRetryPolicy(deadline_seconds=max(read_timeout * 5, 60)),
+        )
 
     def _headers(self) -> dict[str, str]:
         return {"PRIVATE-TOKEN": self._token}
@@ -298,19 +338,22 @@ class GitLabRepoFetcher:
 
     async def default_branch(self, owner: str, repo: str) -> str:
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    self._project(owner, repo), headers=self._headers(), timeout=15
-                )
-                resp.raise_for_status()
-                return str(resp.json().get("default_branch", "main"))
+            resp = await self._request("GET", self._project(owner, repo))
+            resp.raise_for_status()
+            return str(resp.json().get("default_branch", "main"))
         except Exception as exc:
             logger.warning("Failed to fetch default branch for %s/%s: %s", owner, repo, exc)
             return "main"
 
     async def branch_head(self, owner: str, repo: str, branch: str) -> str:
         url = f"{self._project(owner, repo)}/repository/branches/{quote(branch, safe='')}"
-        return _branch_sha(await _fetch_branch(url, self._headers()), "commit", "id")
+        resp = await self._request("GET", url)
+        resp.raise_for_status()
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise IncompleteTreeError("Invalid branch response JSON") from exc
+        return _branch_sha(data, "commit", "id")
 
     async def repo_tree(self, owner: str, repo: str, branch: str) -> list[str]:
         # Keyset pagination via the Link header; recursive lists the whole tree.
@@ -330,58 +373,48 @@ class GitLabRepoFetcher:
         seen_urls: set[str] = set()
         seen_paths: set[str] = set()
         endpoint = httpx.URL(initial_url)
-        async with httpx.AsyncClient() as client:
-            while url:
-                if url in seen_urls:
-                    raise IncompleteTreeError("Repository tree pagination is cyclic")
-                if len(seen_urls) >= _MAX_TREE_PAGES:
-                    raise IncompleteTreeError("Repository tree page limit exceeded")
-                seen_urls.add(url)
-                resp = await client.get(url, headers=self._headers(), timeout=30)
-                # An empty repo (or a ref that doesn't exist yet) 404s.
-                if resp.status_code == 404:
-                    raise EmptyRepoError(owner, repo)
-                resp.raise_for_status()
-                files, entries = _tree_paths(_tree_json(resp))
-                if seen_paths & entries:
-                    raise IncompleteTreeError("Duplicate repository tree page entries")
-                seen_paths.update(entries)
-                paths.extend(files)
-                url = _next_link(resp.headers.get("link", ""))
-                if url:
-                    if not entries:
-                        raise IncompleteTreeError("Repository tree pagination made no progress")
-                    try:
-                        target = httpx.URL(url)
-                    except httpx.InvalidURL as exc:
-                        raise IncompleteTreeError(
-                            "Invalid repository tree pagination link"
-                        ) from exc
-                    if (target.scheme, target.host, target.port, target.path) != (
-                        endpoint.scheme,
-                        endpoint.host,
-                        endpoint.port,
-                        endpoint.path,
-                    ) or target.userinfo:
-                        raise IncompleteTreeError("Invalid repository tree pagination target")
-                    tokens = target.params.get_list("page_token")
-                    # GitLab appends a small set of harmless params (id, page,
-                    # with_last_commit) to keyset next links; every original param
-                    # must survive unchanged. Anything else is refused — notably
-                    # ``path=<subdir>``, which would narrow the listing.
-                    extras = (
-                        set(target.params.keys()) - set(endpoint.params.keys()) - {"page_token"}
+        while url:
+            if url in seen_urls:
+                raise IncompleteTreeError("Repository tree pagination is cyclic")
+            if len(seen_urls) >= _MAX_TREE_PAGES:
+                raise IncompleteTreeError("Repository tree page limit exceeded")
+            seen_urls.add(url)
+            resp = await self._request("GET", url)
+            if resp.status_code == 404:
+                raise EmptyRepoError(owner, repo)
+            resp.raise_for_status()
+            files, entries = _tree_paths(_tree_json(resp))
+            if seen_paths & entries:
+                raise IncompleteTreeError("Duplicate repository tree page entries")
+            seen_paths.update(entries)
+            paths.extend(files)
+            url = _next_link(resp.headers.get("link", ""))
+            if url:
+                if not entries:
+                    raise IncompleteTreeError("Repository tree pagination made no progress")
+                try:
+                    target = httpx.URL(url)
+                except httpx.InvalidURL as exc:
+                    raise IncompleteTreeError("Invalid repository tree pagination link") from exc
+                if (target.scheme, target.host, target.port, target.path) != (
+                    endpoint.scheme,
+                    endpoint.host,
+                    endpoint.port,
+                    endpoint.path,
+                ) or target.userinfo:
+                    raise IncompleteTreeError("Invalid repository tree pagination target")
+                tokens = target.params.get_list("page_token")
+                extras = set(target.params.keys()) - set(endpoint.params.keys()) - {"page_token"}
+                if (
+                    len(tokens) != 1
+                    or not tokens[0]
+                    or not extras <= _GITLAB_TREE_LINK_EXTRAS
+                    or any(
+                        target.params.get_list(key) != [value]
+                        for key, value in endpoint.params.multi_items()
                     )
-                    if (
-                        len(tokens) != 1
-                        or not tokens[0]
-                        or not extras <= _GITLAB_TREE_LINK_EXTRAS
-                        or any(
-                            target.params.get_list(key) != [value]
-                            for key, value in endpoint.params.multi_items()
-                        )
-                    ):
-                        raise IncompleteTreeError("Repository tree pagination query changed")
+                ):
+                    raise IncompleteTreeError("Repository tree pagination query changed")
         return paths
 
     async def file_content(
@@ -391,14 +424,11 @@ class GitLabRepoFetcher:
 
         async def _fetch() -> str | None:
             try:
-                async with httpx.AsyncClient() as client:
-                    resp = await client.get(
-                        url, params={"ref": ref}, headers=self._headers(), timeout=30
-                    )
-                    if resp.status_code == 404:
-                        return None
-                    resp.raise_for_status()
-                    return resp.text
+                resp = await self._request("GET", url, params={"ref": ref})
+                if resp.status_code == 404:
+                    return None
+                resp.raise_for_status()
+                return resp.text
             except Exception as exc:
                 logger.warning("Failed to fetch %s: %s", path, exc)
                 return None
@@ -418,14 +448,17 @@ class GitLabRepoFetcher:
     ) -> dict[str, str] | None:
         url = f"{self._project(owner, repo)}/repository/archive.tar.gz"
         try:
-            async with httpx.AsyncClient(follow_redirects=True, timeout=120) as client:
-                resp = await client.get(url, params={"sha": ref}, headers=self._headers())
-                if resp.status_code != 200:
-                    logger.warning(
-                        "Tarball fetch failed for %s/%s: %d", owner, repo, resp.status_code
-                    )
-                    return None
-                blob = resp.content
+            resp = await self._request(
+                "GET",
+                url,
+                params={"sha": ref},
+                read_timeout=120.0,
+                follow_redirects=True,
+            )
+            if resp.status_code != 200:
+                logger.warning("Tarball fetch failed for %s/%s: %d", owner, repo, resp.status_code)
+                return None
+            blob = resp.content
         except Exception as exc:
             logger.warning("Tarball fetch failed for %s/%s: %s", owner, repo, exc)
             return None
@@ -744,18 +777,10 @@ class BitbucketRepoFetcher:
 
 def _next_link(link_header: str) -> str | None:
     """Extract the rel="next" URL from a Link header (GitLab keyset pagination)."""
-    if not link_header:
-        return None
-    next_url = None
-    for part in link_header.split(","):
-        match = re.fullmatch(r'\s*<([^<>]+)>\s*;\s*rel=(?:"([^"]+)"|([^;\s]+))\s*', part)
-        if not match:
-            raise IncompleteTreeError("Invalid repository tree pagination link")
-        if "next" in (match[2] or match[3]).split():
-            if next_url is not None:
-                raise IncompleteTreeError("Multiple repository tree next links")
-            next_url = match[1]
-    return next_url
+    try:
+        return parse_next_link(link_header)
+    except ValueError as exc:
+        raise IncompleteTreeError(str(exc)) from exc
 
 
 def make_fetcher(platform: str, token: str) -> RepoFetcher:

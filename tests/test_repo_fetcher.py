@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import tarfile
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -10,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+from mira.http import HttpService
 from mira.platforms import fetch
 from mira.platforms.fetch import (
     BitbucketRepoFetcher,
@@ -51,6 +53,13 @@ async def test_branch_head_pins_an_encoded_branch(monkeypatch, fetcher_type, suf
             200, json={"truncated": False, "tree": [{"type": "blob", "path": "keep.py"}]}
         )
 
+    if fetcher_type is GitLabRepoFetcher:
+        fetcher, _ = _gitlab_fetcher_with_transport(serve)
+        fetcher._api = "https://provider.example.invalid/api"
+        commit = await fetcher.branch_head("example", "repo", "release/stable")
+        assert commit == "a" * 40
+        assert requests[0].url.raw_path.endswith(suffix)
+        return
     client_type = httpx.AsyncClient
     monkeypatch.setattr(
         httpx,
@@ -206,6 +215,13 @@ async def test_repo_tarball_failure_still_returns_none(monkeypatch, fetcher, out
             raise httpx.ReadTimeout("synthetic timeout", request=request)
         return httpx.Response(outcome)
 
+    if fetcher is GitLabRepoFetcher:
+        fetcher, _ = _gitlab_fetcher_with_transport(serve, follow_redirects=True)
+        requests.clear()
+        result = await fetcher.repo_tarball("example", "app", "feature#frag")
+        assert result is None
+        assert requests  # the failure handler was actually exercised
+        return
     client_type = httpx.AsyncClient
     monkeypatch.setattr(
         fetch.httpx,
@@ -244,6 +260,42 @@ def _resp(json_data=None, *, text="", headers=None, status=200):
     r.headers = headers or {}
     r.raise_for_status = MagicMock()
     return r
+
+
+class _Recorder(HttpService):
+    def __init__(self, side_effect):
+        super().__init__()
+        self._side_effect = side_effect if callable(side_effect) else iter(side_effect)
+        self.requests: list[httpx.Request] = []
+
+    async def request(self, url, *, method="GET", **kwargs):
+        self.requests.append(httpx.Request(method, url))
+        if callable(self._side_effect):
+            result = self._side_effect(method, url, **kwargs)
+            if hasattr(result, "__await__"):
+                return await result
+            return result
+        return next(self._side_effect)
+
+
+def _gitlab_fetcher_with_transport(serve, follow_redirects=False):
+    def factory(**kwargs):
+        kwargs.pop("client_kwargs", None)
+        return httpx.AsyncClient(
+            transport=httpx.MockTransport(serve),
+            follow_redirects=follow_redirects,
+            **kwargs,
+        )
+
+    service = HttpService(client_factory=factory)
+    return GitLabRepoFetcher("synthetic", http_service=service), service
+
+
+@contextlib.contextmanager
+def _patch_gitlab_service(side_effect):
+    service = _Recorder(side_effect)
+    with patch("mira.platforms.fetch.current_http_service", lambda: service):
+        yield None, service
 
 
 def _patch_client(get_side_effect):
@@ -367,6 +419,15 @@ async def test_file_content_failure_returns_none_and_releases_semaphore(fetcher,
             raise httpx.ReadTimeout("synthetic timeout", request=request)
         return httpx.Response(outcome)
 
+    if fetcher is GitLabRepoFetcher:
+        fetcher, _ = _gitlab_fetcher_with_transport(serve)
+        acquired.clear()
+        content = await fetcher.file_content(
+            "example", "app", "src/main.py", "feature+draft", semaphore
+        )
+        assert content is None
+        assert not semaphore.locked()
+        return
     client = httpx.AsyncClient(transport=httpx.MockTransport(serve))
     with patch("mira.platforms.fetch.httpx.AsyncClient", return_value=client):
         content = await fetcher("synthetic", "https://forge.example.invalid/api").file_content(
@@ -554,7 +615,7 @@ class TestGitLabTreePagination:
             ),
             _resp([{"type": "blob", "path": "b.py"}]),
         ]
-        with _patch_client(pages), pytest.raises(IncompleteTreeError):
+        with _patch_gitlab_service(pages), pytest.raises(IncompleteTreeError):
             await GitLabRepoFetcher("synthetic", "https://gitlab.example.invalid/api/v4").repo_tree(
                 "example", "app", "main"
             )
@@ -568,7 +629,7 @@ class TestGitLabTreePagination:
             },
         )
         page2 = _resp([{"type": "blob", "path": "sub/b.py"}], headers={})
-        with _patch_client([page1, page2]):
+        with _patch_gitlab_service([page1, page2]):
             paths = await GitLabRepoFetcher("tok").repo_tree("grp/sub", "proj", "main")
         assert paths == ["a.py", "sub/b.py"]
 
@@ -591,11 +652,11 @@ class TestGitLabTreePagination:
         page3 = _resp([{"type": "blob", "path": "sub/c.py"}], headers={})
         requested: list[str] = []
 
-        async def serve(url, **kwargs):
+        async def serve(method, url, **kwargs):
             requested.append(str(url))
             return [page1, page2, page3][len(requested) - 1]
 
-        with _patch_client(serve):
+        with _patch_gitlab_service(serve):
             paths = await GitLabRepoFetcher("tok").repo_tree("netlife", "wfp", "master")
         assert paths == ["a.py", "b.py", "sub/c.py"]
         assert len(requested) == 3
@@ -634,7 +695,7 @@ class TestGitLabTreePagination:
             ),
             _resp([{"type": "blob", "path": "b.py"}]),
         ]
-        with _patch_client(pages), pytest.raises(IncompleteTreeError):
+        with _patch_gitlab_service(pages), pytest.raises(IncompleteTreeError):
             await GitLabRepoFetcher("synthetic", "https://gitlab.example.invalid/api/v4").repo_tree(
                 "example", "app", "main"
             )
@@ -657,14 +718,14 @@ class TestGitLabTreePagination:
         )
         requested = 0
 
-        async def serve(url, **kwargs):
+        async def serve(method, url, **kwargs):
             nonlocal requested
             requested += 1
             if requested > 1:
                 pytest.fail("Followed a bad pagination link")
             return page
 
-        with _patch_client(serve), pytest.raises(IncompleteTreeError):
+        with _patch_gitlab_service(serve), pytest.raises(IncompleteTreeError):
             await GitLabRepoFetcher("synthetic", "https://gitlab.example.invalid/api/v4").repo_tree(
                 "o", "r", "main"
             )
@@ -684,14 +745,14 @@ class TestGitLabTreePagination:
         ]
         requested = 0
 
-        async def serve(url, **kwargs):
+        async def serve(method, url, **kwargs):
             nonlocal requested
             requested += 1
             if requested > len(pages):
                 pytest.fail("Repeated a tree page request")
             return pages[requested - 1]
 
-        with _patch_client(serve), pytest.raises(IncompleteTreeError, match="cyclic"):
+        with _patch_gitlab_service(serve), pytest.raises(IncompleteTreeError, match="cyclic"):
             await GitLabRepoFetcher("synthetic", "https://gitlab.example.invalid/api/v4").repo_tree(
                 "o", "r", "main"
             )
@@ -701,11 +762,11 @@ class TestGitLabTreePagination:
     async def test_url_encodes_nested_project(self):
         captured = {}
 
-        async def grab(url, **kw):
+        async def grab(method, url, **kw):
             captured["url"] = url
             return _resp([], headers={})
 
-        with _patch_client(grab):
+        with _patch_gitlab_service(grab):
             await GitLabRepoFetcher("tok").repo_tree("group/sub", "web", "main")
         assert "group%2Fsub%2Fweb" in captured["url"]
 
@@ -723,14 +784,14 @@ class TestGitLabTreePagination:
     async def test_rejects_invalid_next_link_before_request(self, next_link):
         requested = 0
 
-        async def serve(url, **kwargs):
+        async def serve(method, url, **kwargs):
             nonlocal requested
             requested += 1
             if requested > 1:
                 pytest.fail("Followed an invalid pagination link")
             return _resp([{"type": "blob", "path": "a.py"}], headers={"link": next_link})
 
-        with _patch_client(serve), pytest.raises(IncompleteTreeError):
+        with _patch_gitlab_service(serve), pytest.raises(IncompleteTreeError):
             await GitLabRepoFetcher("synthetic", "https://gitlab.example.invalid/api/v4").repo_tree(
                 "example", "app", "main"
             )
@@ -758,14 +819,14 @@ class TestGitLabTreePagination:
         ]
         requested = 0
 
-        async def serve(url, **kwargs):
+        async def serve(method, url, **kwargs):
             nonlocal requested
             requested += 1
             if requested > len(pages):
                 pytest.fail("Repeated a tree page request")
             return pages[requested - 1]
 
-        with _patch_client(serve), pytest.raises(IncompleteTreeError, match="cyclic"):
+        with _patch_gitlab_service(serve), pytest.raises(IncompleteTreeError, match="cyclic"):
             await GitLabRepoFetcher("synthetic", "https://gitlab.example.invalid/api/v4").repo_tree(
                 "example", "app", "main"
             )
@@ -797,7 +858,7 @@ class TestGitLabTreePagination:
         ],
     )
     async def test_rejects_invalid_or_repeated_entries(self, pages):
-        with _patch_client(pages), pytest.raises(IncompleteTreeError):
+        with _patch_gitlab_service(pages), pytest.raises(IncompleteTreeError):
             await GitLabRepoFetcher("synthetic").repo_tree("o", "r", "main")
 
     @pytest.mark.asyncio
@@ -806,7 +867,7 @@ class TestGitLabTreePagination:
         endpoint = "https://gitlab.com/api/v4/projects/o%2Fr/repository/tree"
         requested = 0
 
-        async def serve(url, **kwargs):
+        async def serve(method, url, **kwargs):
             nonlocal requested
             requested += 1
             if requested > 2:
@@ -818,7 +879,7 @@ class TestGitLabTreePagination:
                 },
             )
 
-        with _patch_client(serve), pytest.raises(IncompleteTreeError, match="limit"):
+        with _patch_gitlab_service(serve), pytest.raises(IncompleteTreeError, match="limit"):
             await GitLabRepoFetcher("synthetic").repo_tree("o", "r", "main")
         assert requested == 2
 
@@ -828,22 +889,44 @@ class TestGitLabTreePagination:
 async def test_invalid_tree_json_is_explicit_fetch_error(fetcher):
     response = _resp()
     response.json.side_effect = ValueError("synthetic invalid JSON")
-    with _patch_client([response]), pytest.raises(IncompleteTreeError):
+    cm = (
+        _patch_gitlab_service([response])
+        if fetcher is GitLabRepoFetcher
+        else _patch_client([response])
+    )
+    with cm, pytest.raises(IncompleteTreeError):
         await fetcher("synthetic").repo_tree("example", "app", "main")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fetcher", [GitHubRepoFetcher, GitLabRepoFetcher, ForgejoRepoFetcher])
 async def test_tree_http_error_is_not_an_empty_or_partial_list(fetcher):
-    response = httpx.Response(503, request=httpx.Request("GET", "https://example.invalid/tree"))
-    with _patch_client([response]), pytest.raises(httpx.HTTPStatusError):
+    response = httpx.Response(
+        503,
+        headers={"retry-after": "0"},
+        request=httpx.Request("GET", "https://example.invalid/tree"),
+    )
+    cm = (
+        _patch_gitlab_service([response])
+        if fetcher is GitLabRepoFetcher
+        else _patch_client([response])
+    )
+    with cm, pytest.raises(httpx.HTTPStatusError):
         await fetcher("synthetic").repo_tree("example", "app", "main")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fetcher", [GitHubRepoFetcher, GitLabRepoFetcher, ForgejoRepoFetcher])
 async def test_tree_timeout_is_not_an_empty_or_partial_list(fetcher):
-    with _patch_client(httpx.ReadTimeout("synthetic timeout")), pytest.raises(httpx.ReadTimeout):
+    def side_effect(method, url, **kwargs):
+        raise httpx.ReadTimeout("synthetic timeout", request=httpx.Request(method, url))
+
+    cm = (
+        _patch_gitlab_service(side_effect)
+        if fetcher is GitLabRepoFetcher
+        else _patch_client(httpx.ReadTimeout("synthetic timeout"))
+    )
+    with cm, pytest.raises(httpx.ReadTimeout):
         await fetcher("synthetic").repo_tree("example", "app", "main")
 
 
@@ -851,7 +934,9 @@ class TestEmptyRepo:
     @pytest.mark.asyncio
     async def test_gitlab_tree_404_raises_empty(self):
         with (
-            _patch_client(lambda url, **kw: _resp(status=404, text="404 Tree Not Found")),
+            _patch_gitlab_service(
+                lambda method, url, **kw: _resp(status=404, text="404 Tree Not Found")
+            ),
             pytest.raises(EmptyRepoError),
         ):
             await GitLabRepoFetcher("t").repo_tree("g", "p", "main")

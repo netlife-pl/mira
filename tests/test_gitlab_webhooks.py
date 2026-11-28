@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from mira.config import FilterConfig, MiraConfig
+from mira.http import HttpService
 from mira.platforms.gitlab.auth import GitLabTokenAuth
 from mira.platforms.server import create_app
 
@@ -375,35 +377,26 @@ async def test_note_non_review_ignores_author_filter(client):
     h.assert_awaited_once()
 
 
-class _FakeGitLabResponse:
-    def __init__(self, payload):
-        self.status_code = 200
-        self._payload = payload
-        self.text = ""
-        self.headers = {}
+class _FakeGitLabService(HttpService):
+    """Minimal HttpService stand-in that honours ``active=true`` like GitLab."""
 
-    def json(self):
-        return self._payload
+    instances: list[_FakeGitLabService] = []
 
-
-class _FakeGitLabClient:
-    """Minimal httpx.AsyncClient stand-in that honours ``active=true`` like GitLab."""
-
-    instances: list[_FakeGitLabClient] = []
-
-    def __init__(self, projects):
+    def __init__(self, projects, *, username=None):
+        super().__init__()
         self.projects = projects
+        self.username = username
         self.urls: list[str] = []
         type(self).instances.append(self)
 
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *args):
-        return False
-
-    async def get(self, url, **kwargs):
+    async def request(self, url, *, method="GET", **kwargs):
         self.urls.append(url)
+        if url.endswith("/user"):
+            return httpx.Response(
+                200,
+                json={"username": self.username},
+                request=httpx.Request(method, url),
+            )
         if "active=true" in url:
             # active=true = not archived and not marked for deletion.
             visible = [
@@ -411,15 +404,13 @@ class _FakeGitLabClient:
             ]
         else:
             visible = self.projects
-        return _FakeGitLabResponse(visible)
+        return httpx.Response(200, json=visible, request=httpx.Request(method, url))
 
 
 def _patch_gitlab_http(projects):
-    _FakeGitLabClient.instances = []
-    return patch(
-        "mira.platforms.gitlab.webhook.httpx.AsyncClient",
-        lambda *a, **k: _FakeGitLabClient(projects),
-    )
+    _FakeGitLabService.instances = []
+    service = _FakeGitLabService(projects)
+    return patch("mira.platforms.gitlab.webhook.current_http_service", lambda: service)
 
 
 @pytest.fixture
@@ -442,7 +433,7 @@ async def test_list_gitlab_projects_filters_inactive_server_side(gitlab_project_
     with _patch_gitlab_http(gitlab_project_list):
         projects = await gw.list_gitlab_projects("tok", "https://gitlab.com/api/v4")
 
-    client = _FakeGitLabClient.instances[0]
+    client = _FakeGitLabService.instances[0]
     assert "active=true" in client.urls[0]
     assert "include_pending_delete" not in client.urls[0]
     assert [p["path_with_namespace"] for p in projects] == ["netlife/wfp"]
@@ -464,3 +455,98 @@ async def test_backfill_skips_archived_and_pending_deletion(gitlab_auth, gitlab_
     assert count == 1
     db.register_repo.assert_called_once_with("netlife", "wfp", platform="gitlab")
     db.set_repo_visibility.assert_called_once_with("netlife", "wfp", True, platform="gitlab")
+
+
+@pytest.mark.asyncio
+async def test_gitlab_token_identity_uses_shared_service():
+    service = _FakeGitLabService([], username="mira-bot")
+    auth = GitLabTokenAuth("tok", http_service=service)
+
+    assert await auth.get_bot_identity() == "mira-bot"
+    assert await auth.get_bot_identity() == "mira-bot"  # cached
+    assert len(service.urls) == 1
+    assert service.urls[0].endswith("/user")
+
+
+@pytest.mark.asyncio
+async def test_gitlab_token_identity_falls_back_to_temporary_scope():
+    import contextlib
+
+    service = _FakeGitLabService([], username="scoped-bot")
+
+    @contextlib.asynccontextmanager
+    async def _scope(runtime=None):
+        yield runtime
+
+    with patch("mira.platforms.gitlab.auth.http_service_scope", lambda: _scope(service)):
+        auth = GitLabTokenAuth("tok")
+        assert await auth.get_bot_identity() == "scoped-bot"
+    assert service.urls[0].endswith("/user")
+
+
+@pytest.mark.asyncio
+async def test_gitlab_token_identity_error_is_none():
+    class _Failing(HttpService):
+        async def request(self, url, *, method="GET", **kwargs):
+            raise httpx.ConnectError("synthetic", request=httpx.Request(method, url))
+
+    auth = GitLabTokenAuth("tok", http_service=_Failing())
+    assert await auth.get_bot_identity() is None
+
+
+@pytest.mark.asyncio
+async def test_list_gitlab_projects_stops_on_cross_origin_next_link():
+    from mira.platforms.gitlab import webhook as gw
+
+    class _Linked(HttpService):
+        def __init__(self):
+            super().__init__()
+            self.urls: list[str] = []
+
+        async def request(self, url, *, method="GET", **kwargs):
+            self.urls.append(url)
+            return httpx.Response(
+                200,
+                json=[{"path_with_namespace": "netlife/wfp", "visibility": "private"}],
+                headers={"link": '<https://evil.example/projects?page=2>; rel="next"'},
+                request=httpx.Request(method, url),
+            )
+
+    service = _Linked()
+    with patch("mira.platforms.gitlab.webhook.current_http_service", lambda: service):
+        projects = await gw.list_gitlab_projects("tok", "https://gitlab.com/api/v4")
+
+    assert [p["path_with_namespace"] for p in projects] == ["netlife/wfp"]
+    assert len(service.urls) == 1
+
+
+@pytest.mark.asyncio
+async def test_request_binds_lifespan_http_service(gitlab_auth):
+    seen: list[object] = []
+    service = _FakeGitLabService([], username=BOT)
+
+    app = create_app(
+        app_auth=None,
+        webhook_secret=None,
+        bot_name=BOT,
+        gitlab_auth=gitlab_auth,
+        gitlab_webhook_secret=GL_SECRET,
+    )
+    # Simulate the lifespan binding for an ASGI transport that skips lifespan.
+    app.state.http_service = service
+
+    async def capture(*args, **kwargs):
+        from mira.http import current_http_service
+
+        seen.append(current_http_service())
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        with patch("mira.platforms.gitlab.webhook.handle_merge_request", new=capture):
+            resp = await client.post(
+                "/gitlab/webhook",
+                content=json.dumps(_mr_payload(action="open")),
+                headers={"X-Gitlab-Token": GL_SECRET, "X-Gitlab-Event": "Merge Request Hook"},
+            )
+    assert resp.status_code == 200
+    assert seen == [service]

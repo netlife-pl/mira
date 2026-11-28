@@ -17,6 +17,12 @@ from urllib.parse import quote
 import httpx
 
 from mira.exceptions import ProviderError
+from mira.http import (
+    HttpRetryPolicy,
+    HttpService,
+    current_http_service,
+    http_service_scope,
+)
 from mira.models import (
     BotThreadRecord,
     FileHistoryEntry,
@@ -26,6 +32,7 @@ from mira.models import (
     UnresolvedThread,
 )
 from mira.platforms import profiles
+from mira.platforms.links import same_origin_next_link
 from mira.providers.base import BaseProvider
 from mira.providers.formatting import format_comment_body, format_key_issues
 
@@ -86,10 +93,11 @@ def _build_unified_diff(changes: list[dict[str, Any]]) -> str:
 class GitLabProvider(BaseProvider):
     """GitLab code hosting provider (REST v4)."""
 
-    def __init__(self, token: str) -> None:
+    def __init__(self, token: str, http_service: HttpService | None = None) -> None:
         if not token:
             raise ProviderError("GitLab token is required")
         self._token = token
+        self._http_service = http_service
         self._api = profiles.resolve("gitlab")["api_url"] or "https://gitlab.com/api/v4"
         self._username: str | None = None
 
@@ -105,22 +113,38 @@ class GitLabProvider(BaseProvider):
     async def _request(
         self, method: str, url: str, *, ok: tuple[int, ...] = (200, 201), **kw: Any
     ) -> httpx.Response:
-        headers = {"PRIVATE-TOKEN": self._token, **kw.pop("headers", {})}
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.request(method, url, headers=headers, **kw)
-        if resp.status_code not in ok:
-            raise ProviderError(f"GitLab {method} {url} → {resp.status_code}: {resp.text[:300]}")
-        return resp
+        service = self._http_service or current_http_service()
+        if service is None:
+            async with http_service_scope():
+                return await self._request(method, url, ok=ok, **kw)
+        kwargs = dict(kw)
+        headers = {"PRIVATE-TOKEN": self._token, **kwargs.pop("headers", {})}
+        response = await service.request(
+            url,
+            method=method,
+            credential=self._token,
+            headers=headers,
+            timeout=30.0,
+            policy=HttpRetryPolicy(),
+            **kwargs,
+        )
+        if response.status_code not in ok:
+            raise ProviderError(
+                f"GitLab {method} {url} → {response.status_code}: {response.text[:300]}"
+            )
+        return response
 
     async def _paginate(self, url: str) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         next_url: str | None = url + ("&" if "?" in url else "?") + "per_page=100"
-        async with httpx.AsyncClient(timeout=30) as client:
-            while next_url:
-                resp = await client.get(next_url, headers={"PRIVATE-TOKEN": self._token})
-                resp.raise_for_status()
-                out.extend(resp.json())
-                next_url = _next_link(resp.headers.get("link", ""))
+        while next_url:
+            resp = await self._request("GET", next_url)
+            out.extend(resp.json())
+            try:
+                next_url = same_origin_next_link(self._api, resp.headers.get("link", ""))
+            except ValueError as exc:
+                logger.warning("GitLab pagination stopped: %s", exc)
+                break
         return out
 
     async def _self_username(self) -> str:
@@ -274,16 +298,13 @@ class GitLabProvider(BaseProvider):
 
         sem = asyncio.Semaphore(8)
         base = f"{self._project(pr_info)}/repository/commits"
-        headers = {"PRIVATE-TOKEN": self._token}
 
-        async def _fetch_one(
-            client: httpx.AsyncClient, path: str
-        ) -> tuple[str, list[FileHistoryEntry]]:
+        async def _fetch_one(path: str) -> tuple[str, list[FileHistoryEntry]]:
             async with sem:
                 try:
-                    resp = await client.get(
+                    resp = await self._request(
+                        "GET",
                         base,
-                        headers=headers,
                         params={
                             "path": path,
                             "ref_name": pr_info.head_branch,
@@ -310,8 +331,7 @@ class GitLabProvider(BaseProvider):
                 )
             return path, entries
 
-        async with httpx.AsyncClient(timeout=30) as client:
-            results = await asyncio.gather(*[_fetch_one(client, p) for p in paths])
+        results = await asyncio.gather(*[_fetch_one(p) for p in paths])
         return {path: hist for path, hist in results if hist}
 
     # ── posting ─────────────────────────────────────────────────────
@@ -546,13 +566,3 @@ class GitLabProvider(BaseProvider):
 
     async def remove_label(self, pr_info: PRInfo, label: str) -> None:
         await self._request("PUT", self._mr(pr_info), data={"remove_labels": label})
-
-
-def _next_link(link_header: str) -> str | None:
-    """Extract the rel="next" URL from a Link header."""
-    if not link_header:
-        return None
-    for part in link_header.split(","):
-        if 'rel="next"' in part:
-            return part.split(";")[0].strip().strip("<>")
-    return None

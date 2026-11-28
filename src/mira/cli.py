@@ -19,6 +19,18 @@ from mira.llm import create_llm
 from mira.models import ReviewResult, Severity
 
 
+def _run_async(coro):
+    """Run a CLI coroutine with its own pooled HTTP service lifetime."""
+
+    async def runner():
+        from mira.http import http_service_scope
+
+        async with http_service_scope():
+            return await coro
+
+    return asyncio.run(runner())
+
+
 def _format_text(result: ReviewResult) -> str:
     """Format review result as human-readable text."""
     lines: list[str] = []
@@ -253,12 +265,12 @@ def review(
 
     try:
         if snapshot is not None:
-            result = asyncio.run(engine.review_diff(local_diff, local_snapshot=snapshot))
+            result = _run_async(engine.review_diff(local_diff, local_snapshot=snapshot))
         elif use_stdin:
             diff_text = sys.stdin.read()
-            result = asyncio.run(engine.review_diff(diff_text))
+            result = _run_async(engine.review_diff(diff_text))
         else:
-            result = asyncio.run(engine.review_pr(pr_url))  # type: ignore[arg-type]
+            result = _run_async(engine.review_pr(pr_url))  # type: ignore[arg-type]
     except MiraError as e:
         raise click.ClickException(str(e)) from e
 
@@ -389,8 +401,6 @@ def serve(
 ) -> None:
     """Run the Mira webhook server for GitHub, GitLab, Forgejo, and/or Bitbucket."""
     try:
-        import asyncio
-
         import uvicorn
 
         from mira.config import set_global_defaults
@@ -471,7 +481,7 @@ def serve(
     if not bot_name:
         identity_auth = app_auth or gitlab_auth or forgejo_auth or bitbucket_auth
         if identity_auth is not None:
-            bot_name = asyncio.run(identity_auth.get_bot_identity()) or "miracodeai"
+            bot_name = _run_async(identity_auth.get_bot_identity()) or "miracodeai"
             # Bitbucket nicknames may contain characters the server rejects.
             if not all(c.isascii() and (c.isalnum() or c in "_-") for c in bot_name):
                 click.echo(f"Detected bot identity {bot_name!r} is not a valid @mention name")
@@ -548,7 +558,6 @@ def backfill_contributors(
     verbose: bool,
 ) -> None:
     """Backfill historical contributor activity (PRs, reviews, commits) from GitHub."""
-    import asyncio
     from datetime import datetime
 
     from mira.platforms.github.auth import GitHubAppAuth
@@ -585,14 +594,14 @@ def backfill_contributors(
         if "/" not in repo_spec:
             raise click.UsageError("--repo must be in the form owner/repo")
         owner, repo = repo_spec.split("/", 1)
-        counts = asyncio.run(
+        counts = _run_async(
             backfill_repo_contributions(
                 owner, repo, app_auth, since=since_epoch, include_commits=include_commits
             )
         )
         click.echo(f"Backfilled {owner}/{repo}: {counts}")
     else:
-        totals = asyncio.run(
+        totals = _run_async(
             backfill_all_repos(app_auth, since=since_epoch, include_commits=include_commits)
         )
         click.echo(f"Backfill complete: {totals}")
