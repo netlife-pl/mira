@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import httpx
 import pytest
 
 from mira.exceptions import ProviderError
+from mira.http import HttpService
 from mira.models import PRInfo, ReviewComment, ReviewResult, Severity
 from mira.providers import create_provider
 from mira.providers.gitlab import GitLabProvider, _build_unified_diff, parse_mr_url
@@ -27,25 +29,20 @@ class _FakeResp:
             raise RuntimeError(f"HTTP {self.status_code}")
 
 
-class _FakeClient:
+class _ServiceResponder(HttpService):
     def __init__(self, handler):
+        super().__init__()
         self._handler = handler
 
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *a):
-        return False
-
-    async def request(self, method, url, **kw):
-        return self._handler(method, url, **kw)
-
-    async def get(self, url, **kw):
-        return self._handler("GET", url, **kw)
+    async def request(self, url, *, method="GET", **kwargs):
+        return self._handler(method, url, **kwargs)
 
 
 def _patch(handler):
-    return patch("mira.providers.gitlab.httpx.AsyncClient", lambda *a, **k: _FakeClient(handler))
+    return patch(
+        "mira.providers.gitlab.current_http_service",
+        lambda: _ServiceResponder(handler),
+    )
 
 
 _PR = PRInfo(
@@ -184,6 +181,27 @@ class TestGetPrInfo:
         assert info.title == "Example MR"
         assert info.author == expected_username
         assert info.author_avatar_url == ""
+
+
+@pytest.mark.asyncio
+async def test_post_review_replays_only_explicit_429_write() -> None:
+    bodies: list[bytes] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(request.content)
+        if len(bodies) == 1:
+            return httpx.Response(429, headers={"retry-after": "0"})
+        return httpx.Response(201, json={})
+
+    service = HttpService(
+        client_factory=lambda **kwargs: httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), **kwargs
+        )
+    )
+    provider = GitLabProvider("tok", http_service=service)
+    with patch("mira.providers.gitlab.current_http_service", lambda: service):
+        await provider.post_comment(_PR, "hello")
+    assert len(bodies) == 2
 
 
 class TestPostReview:

@@ -206,6 +206,7 @@ class HttpService:
         headers: dict[str, str] | None = None,
         credential: str = "",
         content: bytes | str | None = None,
+        data: dict[str, Any] | None = None,
         json: Any | None = None,
         params: dict[str, Any] | None = None,
         policy: HttpRetryPolicy,
@@ -237,6 +238,8 @@ class HttpService:
             kwargs: dict[str, Any] = {"headers": request_headers}
             if content is not None:
                 kwargs["content"] = content
+            if data is not None:
+                kwargs["data"] = data
             if json is not None:
                 kwargs["json"] = json
             if params is not None:
@@ -349,25 +352,25 @@ class HttpService:
                 break
 
         outcome = retry_state.outcome
-        status_code: int | None = None
+        final_status: int | None = None
         try:
-            status_code = outcome.result().status_code if outcome and not outcome.failed else None
+            final_status = outcome.result().status_code if outcome and not outcome.failed else None
         except BaseException:
-            status_code = None
+            final_status = None
         if outcome is None:
             raise HttpRequestError(
                 "exhausted retries",
                 attempts or policy.max_attempts,
-                status_code=status_code,
+                status_code=final_status,
                 url=url,
             )
         if outcome.failed:
-            exc = outcome.exception()
+            terminal = outcome.exception()
             raise HttpRequestError(
-                f"terminal transport failure: {type(exc).__name__}",
+                f"terminal transport failure: {type(terminal).__name__}",
                 attempts or policy.max_attempts,
                 url=url,
-            ) from exc
+            ) from terminal
         return outcome.result()
 
 

@@ -13,9 +13,13 @@ import logging
 import re
 from typing import Any
 
-import httpx
-
 from mira.config import load_config
+from mira.http import (
+    HttpRetryPolicy,
+    HttpService,
+    current_http_service,
+    http_service_scope,
+)
 from mira.platforms import profiles
 from mira.platforms.auth import PlatformAuth
 from mira.platforms.base_branch_policy import base_branch_is_filtered_for_repo
@@ -32,7 +36,11 @@ from mira.providers import create_provider
 logger = logging.getLogger(__name__)
 
 
-async def list_gitlab_projects(token: str, base_url: str) -> list[dict[str, Any]]:
+async def list_gitlab_projects(
+    token: str,
+    base_url: str,
+    http_service: HttpService | None = None,
+) -> list[dict[str, Any]]:
     """Every active project the token can access (paginated). Scope follows the
     token: a project token → that project; a group token → the group's projects;
     a PAT → everything the user is a member of.
@@ -42,20 +50,29 @@ async def list_gitlab_projects(token: str, base_url: str) -> list[dict[str, Any]
     ``marked_for_deletion_on``, so neither can be filtered client-side;
     ``include_pending_delete`` would work but is administrator-only.
     """
+    service = http_service or current_http_service()
+    if service is None:
+        async with http_service_scope() as scoped:
+            return await list_gitlab_projects(token, base_url, http_service=scoped)
+
     out: list[dict[str, Any]] = []
     url: str | None = (
         f"{base_url.rstrip('/')}/projects?membership=true&simple=true&active=true&per_page=100"
     )
-    async with httpx.AsyncClient(timeout=30) as client:
-        while url:
-            resp = await client.get(url, headers={"PRIVATE-TOKEN": token})
-            if resp.status_code != 200:
-                logger.warning(
-                    "GitLab project list failed: %d %s", resp.status_code, resp.text[:200]
-                )
-                break
-            out.extend(resp.json())
-            url = _next_link(resp.headers.get("link", ""))
+    while url:
+        resp = await service.request(
+            url,
+            method="GET",
+            credential=token,
+            headers={"PRIVATE-TOKEN": token},
+            timeout=30.0,
+            policy=HttpRetryPolicy(deadline_seconds=150.0),
+        )
+        if resp.status_code != 200:
+            logger.warning("GitLab project list failed: %d %s", resp.status_code, resp.text[:200])
+            break
+        out.extend(resp.json())
+        url = _next_link(resp.headers.get("link", ""))
     return out
 
 

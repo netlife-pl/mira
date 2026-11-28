@@ -22,6 +22,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from mira.http import HttpService, http_service_scope
 from mira.platforms.github.auth import GitHubAppAuth
 from mira.platforms.github.webhook import (
     _verify_signature,
@@ -61,81 +62,89 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        # Backfill is a GitHub-installation concept; skip it on GitLab-only.
-        backfill_task = (
-            asyncio.create_task(backfill_missing_indexes(app_auth))
-            if app_auth is not None
-            else None
-        )
-        if backfill_task is not None:
-            backfill_task.add_done_callback(
-                lambda t: (
-                    logger.warning("Backfill failed: %s", t.exception()) if t.exception() else None
-                )
+        # One pooled HTTP service for the process. Tasks created below inherit
+        # it; request handlers fall back to a scoped service of their own.
+        http_service = HttpService()
+        app.state.http_service = http_service
+        async with http_service_scope(http_service):
+            # Backfill is a GitHub-installation concept; skip it on GitLab-only.
+            backfill_task = (
+                asyncio.create_task(backfill_missing_indexes(app_auth))
+                if app_auth is not None
+                else None
             )
-
-        # GitLab's equivalent: discover the projects the token can access and
-        # register them so they're in the dashboard ready to index up front.
-        if gitlab_auth is not None:
-            from mira.platforms.gitlab.webhook import backfill_gitlab_projects
-
-            gl_task = asyncio.create_task(backfill_gitlab_projects(gitlab_auth))
-            gl_task.add_done_callback(
-                lambda t: (
-                    logger.warning("GitLab discovery failed: %s", t.exception())
-                    if t.exception()
-                    else None
+            if backfill_task is not None:
+                backfill_task.add_done_callback(
+                    lambda t: (
+                        logger.warning("Backfill failed: %s", t.exception())
+                        if not t.cancelled() and t.exception()
+                        else None
+                    )
                 )
-            )
 
-        # Forgejo's equivalent: discover repos the token can access and
-        # register them so they're in the dashboard ready to index up front.
-        if forgejo_auth is not None:
-            from mira.platforms.forgejo.webhook import backfill_forgejo_repos
+            # GitLab's equivalent: discover the projects the token can access and
+            # register them so they're in the dashboard ready to index up front.
+            gl_task = None
+            if gitlab_auth is not None:
+                from mira.platforms.gitlab.webhook import backfill_gitlab_projects
 
-            fj_task = asyncio.create_task(backfill_forgejo_repos(forgejo_auth))
-            fj_task.add_done_callback(
-                lambda t: (
-                    logger.warning("Forgejo discovery failed: %s", t.exception())
-                    if t.exception()
-                    else None
+                gl_task = asyncio.create_task(backfill_gitlab_projects(gitlab_auth))
+                gl_task.add_done_callback(
+                    lambda t: (
+                        logger.warning("GitLab discovery failed: %s", t.exception())
+                        if not t.cancelled() and t.exception()
+                        else None
+                    )
                 )
-            )
 
-        # Bitbucket's equivalent: discover the repos the credential can access.
-        bb_task = None
-        if bitbucket_auth is not None:
-            from mira.platforms.bitbucket.webhook import backfill_bitbucket_repos
+            # Forgejo's equivalent: discover repos the token can access and
+            # register them so they're in the dashboard ready to index up front.
+            fj_task = None
+            if forgejo_auth is not None:
+                from mira.platforms.forgejo.webhook import backfill_forgejo_repos
 
-            bb_task = asyncio.create_task(backfill_bitbucket_repos(bitbucket_auth))
-            bb_task.add_done_callback(
+                fj_task = asyncio.create_task(backfill_forgejo_repos(forgejo_auth))
+                fj_task.add_done_callback(
+                    lambda t: (
+                        logger.warning("Forgejo discovery failed: %s", t.exception())
+                        if not t.cancelled() and t.exception()
+                        else None
+                    )
+                )
+
+            # Bitbucket's equivalent: discover the repos the credential can access.
+            bb_task = None
+            if bitbucket_auth is not None:
+                from mira.platforms.bitbucket.webhook import backfill_bitbucket_repos
+
+                bb_task = asyncio.create_task(backfill_bitbucket_repos(bitbucket_auth))
+                bb_task.add_done_callback(
+                    lambda t: (
+                        logger.warning("Bitbucket discovery failed: %s", t.exception())
+                        if not t.cancelled() and t.exception()
+                        else None
+                    )
+                )
+
+            from mira.security.poller import run_forever as run_vuln_poller
+
+            vuln_task = asyncio.create_task(run_vuln_poller())
+            vuln_task.add_done_callback(
                 lambda t: (
-                    logger.warning("Bitbucket discovery failed: %s", t.exception())
+                    logger.warning("Vuln poller crashed: %s", t.exception())
                     if not t.cancelled() and t.exception()
                     else None
                 )
             )
 
-        from mira.security.poller import run_forever as run_vuln_poller
-
-        vuln_task = asyncio.create_task(run_vuln_poller())
-        vuln_task.add_done_callback(
-            lambda t: (
-                logger.warning("Vuln poller crashed: %s", t.exception())
-                if t.exception() and not t.cancelled()
-                else None
-            )
-        )
-
-        yield
-        if backfill_task is not None and not backfill_task.done():
-            backfill_task.cancel()
-        if forgejo_auth is not None and not fj_task.done():
-            fj_task.cancel()
-        if bb_task is not None and not bb_task.done():
-            bb_task.cancel()
-        if not vuln_task.done():
-            vuln_task.cancel()
+            try:
+                yield
+            finally:
+                tasks = [t for t in (backfill_task, gl_task, fj_task, bb_task, vuln_task) if t]
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                await http_service.aclose()
 
     app = FastAPI(title="Mira", lifespan=lifespan)
 
